@@ -118,6 +118,13 @@ Verified end to end against Nikon Z 6_2 (NEF) and Canon EOS R7 (CR3) files.
 The autofocus parsing is specific to those two vendors; everything else is
 vendor-neutral.
 
+## Roadmap
+
+[PLAN.md](PLAN.md) plans colour temperature reading and setting, EV-binned
+zone histograms, and per-zone exposure control. It also records a correctness
+problem it uncovered in the existing `exposure_ev`, which applies its
+multiplication to display-encoded rather than linear values.
+
 ## Status
 
 Version 0.1.0. The API is young and the struct layouts are append-only from
