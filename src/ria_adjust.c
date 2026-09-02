@@ -37,8 +37,7 @@ static int is_neutral(float v, float neutral) {
 int ria_adjustments_is_identity(const ria_adjustments* adj) {
     if (!adj) return 1;
     return is_neutral(adj->wb_r, 1.0f) && is_neutral(adj->wb_g, 1.0f) &&
-           is_neutral(adj->wb_b, 1.0f) && is_neutral(adj->exposure_ev, 0.0f) &&
-           is_neutral(adj->black_point, 0.0f) &&
+           is_neutral(adj->wb_b, 1.0f) && is_neutral(adj->black_point, 0.0f) &&
            is_neutral(adj->white_point, 1.0f) &&
            is_neutral(adj->shadows, 0.0f) && is_neutral(adj->highlights, 0.0f) &&
            is_neutral(adj->contrast, 0.0f) && is_neutral(adj->gamma, 1.0f) &&
@@ -66,9 +65,18 @@ static inline float highlight_weight(float v) {
     return 4.0f * v * v * (1.0f - v);
 }
 
+/*
+ * The display-referred tone chain, evaluated once per input level.
+ *
+ * There is deliberately no exposure term here. An exposure adjustment is a
+ * ratio of scene light, and `v` is an encoded code value that has already
+ * been through a tone curve — multiplying it by 2^EV is not a stop and, on a
+ * LibRaw-decoded frame, over-brightens by more than a stop at the top of the
+ * range. Exposure lives in the scene-referred domain; see
+ * ria_decode_options_scene_linear.
+ */
 static float transfer(float v, const ria_adjustments* adj, float wb) {
     v *= wb;
-    if (adj->exposure_ev != 0.0f) v *= powf(2.0f, adj->exposure_ev);
 
     const float black = adj->black_point;
     const float white = adj->white_point;
@@ -476,15 +484,22 @@ ria_status ria_suggest_adjustments(const ria_image* img,
     }
 
     /*
-     * Aim the median at 0.45 — a middle grey that suits most scenes — and cap
-     * the correction at one stop either way. Beyond that the frame is
-     * intentionally high or low key, and "fixing" it would be a worse result
-     * than leaving it alone.
+     * Aim the median at 0.45 — a middle grey that suits most scenes.
+     *
+     * This used to be suggested as an exposure in stops, which was wrong
+     * twice over: the value is a display code, not scene light, and a scale
+     * would drag the white point with it. A gamma does the right thing here,
+     * because v^(1/g) fixes both endpoints and moves only what lies between
+     * them. Solving med^(1/g) = 0.45 gives g = ln(med)/ln(0.45).
+     *
+     * Clamped to [0.5, 2], roughly a stop of midtone movement either way.
+     * Beyond that the frame is deliberately high or low key and "fixing" it
+     * is a worse result than leaving it alone.
      */
     const float med = (float)median / 255.0f;
-    if (med > 0.001f) {
-        const float ev = log2f(0.45f / med);
-        adj->exposure_ev = ria_clampf(ev, -1.0f, 1.0f);
+    if (med > 0.001f && med < 0.999f) {
+        const float g = logf(med) / logf(0.45f);
+        adj->gamma = ria_clampf(g, 0.5f, 2.0f);
     }
 
     return RIA_OK;

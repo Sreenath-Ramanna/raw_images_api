@@ -14,6 +14,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 #include <string.h>
 #include <time.h>
 
@@ -151,12 +152,15 @@ static int cmd_preview(const char* path, const char* out_path) {
 /* ── decode ──────────────────────────────────────────────────────────────── */
 
 typedef struct {
-    ria_decode_options decode;
-    ria_adjustments    adjust;
-    float              auto_levels;   /* < 0 = off                          */
-    float              sharpen;       /* amount, 0 = off                    */
-    float              blur;          /* sigma, 0 = off                     */
-    int                fit;           /* longest edge, 0 = off              */
+    ria_decode_options    decode;
+    ria_adjustments       adjust;
+    ria_display_transform display;
+    int                   scene;         /* 1 = scene-referred pipeline      */
+    float                 exposure_ev;   /* scene path only                  */
+    float                 auto_levels;   /* < 0 = off                        */
+    float                 sharpen;       /* amount, 0 = off                  */
+    float                 blur;          /* sigma, 0 = off                   */
+    int                   fit;           /* longest edge, 0 = off            */
 } tool_options;
 
 static void usage(void) {
@@ -173,7 +177,15 @@ static void usage(void) {
         "  --bits 8|16            output depth (default 8)\n"
         "  --demosaic N           0 linear 1 VNG 2 PPG 3 AHD 4 DCB 11 DHT\n"
         "  --no-auto-bright       do not stretch the histogram\n"
-        "  --exposure EV          -5..5\n"
+        "\n"
+        "scene-referred options (imply --scene):\n"
+        "  --scene                decode linear 16-bit, render via the\n"
+        "                         display transform. Required for EV work.\n"
+        "  --exposure EV          -3..3, a real stop in linear light\n"
+        "  --shoulder W           roll off scene values up to W into white\n"
+        "                         (1.0 = hard clip, 4.0 = two extra stops)\n"
+        "\n"
+        "display-referred options:\n"
         "  --contrast N           -1..1\n"
         "  --shadows N            -1..1\n"
         "  --highlights N         -1..1\n"
@@ -187,8 +199,26 @@ static void usage(void) {
 }
 
 static int parse_decode_args(int argc, char** argv, tool_options* o) {
-    ria_decode_options_defaults(&o->decode);
+    /* Scan for the scene-referred flags first: they change the decode
+     * preset, and a preset chosen after --bits 16 would overwrite it. */
+    int scene = 0;
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--scene") == 0 ||
+            strcmp(argv[i], "--exposure") == 0 ||
+            strcmp(argv[i], "--shoulder") == 0) {
+            scene = 1;
+        }
+    }
+
+    if (scene) {
+        ria_decode_options_scene_linear(&o->decode);
+    } else {
+        ria_decode_options_defaults(&o->decode);
+    }
     ria_adjustments_defaults(&o->adjust);
+    ria_display_transform_defaults(&o->display);
+    o->scene = 0;
+    o->exposure_ev = 0.0f;
     o->auto_levels = -1.0f;
     o->sharpen = 0.0f;
     o->blur = 0.0f;
@@ -217,9 +247,17 @@ static int parse_decode_args(int argc, char** argv, tool_options* o) {
         } else if (strcmp(a, "--demosaic") == 0) {
             NEED_VALUE();
             o->decode.demosaic = (ria_demosaic)atoi(next);
+        } else if (strcmp(a, "--scene") == 0) {
+            o->scene = 1;
         } else if (strcmp(a, "--exposure") == 0) {
             NEED_VALUE();
-            o->adjust.exposure_ev = (float)atof(next);
+            o->exposure_ev = (float)atof(next);
+            o->scene = 1;
+        } else if (strcmp(a, "--shoulder") == 0) {
+            NEED_VALUE();
+            o->display.white_point = (float)atof(next);
+            o->display.mode = RIA_DISPLAY_SHOULDER;
+            o->scene = 1;
         } else if (strcmp(a, "--contrast") == 0) {
             NEED_VALUE();
             o->adjust.contrast = (float)atof(next);
@@ -274,8 +312,36 @@ static int cmd_decode(const char* path, const char* out_path, int argc,
     ria_image* img = NULL;
     ria_status rc = ria_decode_file(path, &o.decode, &img);
     if (rc != RIA_OK) return fail("decode", rc);
-    printf("decode        %7.0f ms  %d x %d, %d-bit\n", now_ms() - t0,
-           img->width, img->height, img->bits);
+    printf("decode        %7.0f ms  %d x %d, %d-bit, %s\n", now_ms() - t0,
+           img->width, img->height, img->bits,
+           img->transfer == RIA_TRANSFER_LINEAR ? "scene-referred"
+                                                : "display-referred");
+
+    if (o.scene) {
+        /*
+         * Exposure, done properly: a scale on linear light. It is expressed
+         * here by moving the display transform's grey point, because that is
+         * exactly what a stop is once the data is linear — halving the scene
+         * value anchored to middle grey brightens the result by 1 EV.
+         */
+        if (o.exposure_ev != 0.0f) {
+            o.display.grey_point = 0.18f / powf(2.0f, o.exposure_ev);
+        }
+
+        t0 = now_ms();
+        ria_image* shown = NULL;
+        rc = ria_apply_display_transform(img, &o.display, RIA_FMT_RGB8, &shown);
+        if (rc != RIA_OK) {
+            ria_image_free(img);
+            return fail("display transform", rc);
+        }
+        ria_image_free(img);
+        img = shown;
+        printf("display       %7.0f ms  %s, %+.2f EV, white %.2f\n",
+               now_ms() - t0,
+               o.display.mode == RIA_DISPLAY_SHOULDER ? "shoulder" : "clip",
+               (double)o.exposure_ev, (double)o.display.white_point);
+    }
 
     if (o.auto_levels >= 0.0f) {
         t0 = now_ms();

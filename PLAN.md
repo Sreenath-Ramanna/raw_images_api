@@ -87,7 +87,9 @@ unnecessary. What is missing is the *zone* view (approach.md §6).
 
 **Feature 5's exposure half exists and is wrong.** `ria_adjustments.exposure_ev`
 multiplies display-encoded values: `+1 EV` on mid-grey clips to 255 where the
-correct answer is 174, an error of over a stop that grows with input value.
+correct answer is 184 — the naive result is 0.93 EV too bright, and the
+error grows with input value until everything above encoded 192 is pinned at
+white.
 `tests/test_ria.c` asserts the wrong behaviour and pins the defect in place.
 It is removed, not fixed — see approach.md §10.
 
@@ -95,32 +97,51 @@ It is removed, not fixed — see approach.md §10.
 
 ## 2. Phases
 
-### Phase A — scene-referred foundation
+### Phase A — scene-referred foundation ✅ done
 
 **Blocks everything. Nothing below is correct without it.**
 
+Landed. `RIA_DISPLAY_CLIP` with default parameters reproduces a LibRaw decode
+to a mean difference of **0.19 code values, worst case 1**, which is the check
+that the reimplementation of dcraw's `gamma_curve` is faithful. End to end on a
+test frame: the scene path at `+1.7 EV` reaches the same mean brightness as the
+default decode — confirming the auto-brightness measurement — and `+2.5 EV`
+with a shoulder reaches it while clipping **0.00 %** against the default's
+0.74 %.
+
+Two deviations from what was planned, both explained below: the fused render
+entry point moved to Phase E, and the preset uses `highlight_mode 0` rather
+than 2.
+
 - Linear decode preset: `gamma 1.0`, `output_bits 16`, `no_auto_bright 1`,
-  `highlight_mode 2`. Verified — median lands at −3.1 EV with 0.00 % clipped,
-  against −0.71 EV and 1.41 % for the default.
+  `highlight_mode 0`. Verified — the median lands at −3.11 EV and −3.09 EV on
+  two different cameras, against −0.71 EV for the display default, and 1.0
+  means sensor saturation on both.
 - `ria_image` gains `transfer`, `transfer_gamma`, `transfer_slope`,
   `colorspace` (all appended; the struct stays ABI-compatible). A decoded image
   now knows what domain it is in.
 - Display transform (`ria_apply_display_transform`), with `RIA_DISPLAY_CLIP`
   reproducing today's behaviour exactly so nothing regresses, and
   `RIA_DISPLAY_SHOULDER` for the extended-Reinhard rolloff.
-- The fused render path (`ria_render_scene_to_display`) — 16-bit linear in,
-  8-bit display out, intermediates in float registers. This is a **correctness**
-  requirement, not an optimisation: a materialised intermediate clamps
-  everything the tone engine pushes above 1.0, which is exactly what the
-  shoulder exists to compress (approach.md §3).
+- ~~The fused render path (`ria_render_scene_to_display`)~~ — **moved to
+  Phase E.** There is nothing to fuse until the tone engine exists;
+  `ria_apply_display_transform` is already a single LUT-driven pass with float
+  intermediates, so the correctness requirement is met for now. The requirement
+  itself stands and lands with the tone engine: a materialised intermediate
+  between the two would clamp everything above 1.0, which is exactly what the
+  shoulder exists to compress.
 - Remove `ria_adjustments.exposure_ev`; rewrite the tests that asserted it.
+  Done — including the assertion that pinned the defect. `ria_suggest_adjustments`
+  now proposes a `gamma` instead, which is the display-domain way to move the
+  midtones without dragging the endpoints.
 
 **No float sample type.** Measurement moved this out of Phase A — see the
 re-scoping note below.
 
-**Effort: 1.5 sittings**, down from 2. The display transform and fused path
-are about a sitting together; the test rework is small but must not be
-skipped.
+**Effort: 1.5 sittings estimated; roughly that in practice.** Most of the
+unplanned time went on two things worth recording: reimplementing dcraw's
+gamma curve faithfully rather than approximating it, and discovering the
+`highlight_mode` anchor problem by rendering the result.
 
 #### Why float left Phase A
 
@@ -139,7 +160,6 @@ What buys top-end headroom instead, all measured:
 | | effect |
 |---|---|
 | linear + `no_auto_bright` | clipped 1.41 % → 0.00 % (Nikon), 2.25 % → 0.13 % (Canon) |
-| `highlight_mode 2` | Canon clipped 0.126 % → 0.000 % |
 | the resulting headroom | 2–3 stops above the 95th percentile |
 | float registers in the fused path | unbounded, and free |
 

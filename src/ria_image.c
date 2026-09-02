@@ -56,14 +56,37 @@ ria_status ria_image_alloc(int width, int height, ria_pixel_format fmt,
     priv->pub.format = fmt;
     priv->pub.pending_flip = RIA_FLIP_NONE;
 
+    /* Assume display-referred sRGB for a buffer of unknown provenance — a
+     * caller wrapping a screenshot or a decoded JPEG has that, and it is the
+     * safe assumption because the operations that care refuse anything but
+     * linear rather than trusting the label. ria_raw_decode overwrites this
+     * with what it actually produced. */
+    priv->pub.transfer = RIA_TRANSFER_SRGB;
+    priv->pub.transfer_gamma = 2.4f;
+    priv->pub.transfer_slope = 12.92f;
+    priv->pub.colorspace = RIA_COLORSPACE_SRGB;
+
     *out = &priv->pub;
     return RIA_OK;
+}
+
+/* Geometry and format operations must carry the encoding across, or a
+ * resized scene-referred image silently claims to be display-referred and the
+ * next EV operation refuses it. */
+void ria_image_copy_encoding(ria_image* dst, const ria_image* src) {
+    dst->transfer = src->transfer;
+    dst->transfer_gamma = src->transfer_gamma;
+    dst->transfer_slope = src->transfer_slope;
+    dst->colorspace = src->colorspace;
 }
 
 ria_status ria_image_like(const ria_image* like, ria_image** out) {
     ria_status rc = ria_image_alloc(like->width, like->height, like->format,
                                     NULL, 0, out);
-    if (rc == RIA_OK) (*out)->pending_flip = like->pending_flip;
+    if (rc == RIA_OK) {
+        (*out)->pending_flip = like->pending_flip;
+        ria_image_copy_encoding(*out, like);
+    }
     return rc;
 }
 
@@ -205,6 +228,7 @@ ria_status ria_image_convert(const ria_image* src, ria_pixel_format fmt,
     ria_status rc = ria_image_alloc(src->width, src->height, fmt, NULL, 0, out);
     if (rc != RIA_OK) return rc;
     (*out)->pending_flip = src->pending_flip;
+    ria_image_copy_encoding(*out, src);
 
     ria_image* dst = *out;
     const int sc = src->channels, sb = src->bits;
@@ -250,6 +274,7 @@ ria_status ria_crop(const ria_image* src, int x, int y, int width, int height,
     ria_status rc = ria_image_alloc(width, height, src->format, NULL, 0, out);
     if (rc != RIA_OK) return rc;
     (*out)->pending_flip = src->pending_flip;
+    ria_image_copy_encoding(*out, src);
 
     const size_t bpp = (size_t)src->channels * (size_t)(src->bits / 8);
     for (int row = 0; row < height; row++) {
@@ -289,6 +314,7 @@ ria_status ria_apply_orientation(const ria_image* src, int flip,
     ria_status rc = ria_image_alloc(dw, dh, src->format, NULL, 0, out);
     if (rc != RIA_OK) return rc;
     (*out)->pending_flip = RIA_FLIP_NONE;
+    ria_image_copy_encoding(*out, src);
 
     ria_image* dst = *out;
     const size_t bpp = (size_t)src->channels * (size_t)(src->bits / 8);
@@ -514,6 +540,7 @@ ria_status ria_resize(const ria_image* src, int width, int height,
     ria_status rc = ria_image_alloc(width, height, src->format, NULL, 0, out);
     if (rc != RIA_OK) return rc;
     (*out)->pending_flip = src->pending_flip;
+    ria_image_copy_encoding(*out, src);
 
     if (filter == RIA_RESIZE_NEAREST) {
         resize_nearest(src, width, height, *out);

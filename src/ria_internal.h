@@ -38,6 +38,11 @@ ria_status ria_image_alloc(int width, int height, ria_pixel_format fmt,
 /* Same geometry and format as `like`, uninitialised pixels. */
 ria_status ria_image_like(const ria_image* like, ria_image** out);
 
+/* Carry transfer function and colourspace from one image to another. Every
+ * operation producing a new image must call this, or a scene-referred buffer
+ * silently comes back labelled display-referred. */
+void ria_image_copy_encoding(ria_image* dst, const ria_image* src);
+
 /*
  * Hand the pixel buffer to the caller and drop ownership of it, so that
  * ria_image_free releases only the struct. Used by the legacy ABI shim,
@@ -66,6 +71,11 @@ static inline float ria_clampf(float v, float lo, float hi) {
 static inline int ria_clampi(int v, int lo, int hi) {
     return v < lo ? lo : (v > hi ? hi : v);
 }
+
+/* The photographic grey card, as a linear reflectance. Both the anchor of the
+ * display transform and the default pivot for contrast, so it is defined once
+ * — the two must agree or a neutral edit shifts brightness. */
+#define RIA_MIDDLE_GREY 0.18
 
 /* Rec.709 luma, defined once: greyscale conversion, saturation and the luma
  * histogram must agree or a round trip through them shifts brightness. */

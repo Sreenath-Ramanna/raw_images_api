@@ -40,7 +40,7 @@ sudo apt-get install libraw-dev cmake ninja-build        # Debian / Ubuntu
 ```bash
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
-./build/ria_tests                     # 208 checks, no camera files needed
+./build/ria_tests                     # 304 checks, no camera files needed
 sudo cmake --install build            # optional
 ```
 
@@ -124,11 +124,15 @@ vendor-neutral.
 setting, EV-binned zone histograms, per-zone exposure control, and
 exposure/contrast in stops. [PLAN.md](PLAN.md) sequences that work.
 
-Both turn on one point: those operations are only meaningful on
-**scene-referred linear** data, and the current decode is display-referred —
-it clips 1.4–2.3 % of a frame and applies a scene-dependent +1.7 EV before any
-control is touched. `ria_adjustments.exposure_ev` is defective for that
-reason and is removed rather than patched.
+**Phase A has landed**: `ria_decode_options_scene_linear` gives a
+scene-referred linear decode, `ria_image.transfer` records which domain a
+buffer is in, and `ria_apply_display_transform` makes the scene-to-display
+stage explicit — with a highlight shoulder, so a `+2.5 EV` render can be as
+bright as the default one and clip nothing where the default clips 0.74 %. See
+[API.md §8](API.md#8-scene-referred-work).
+
+`ria_adjustments.exposure_ev` was removed in the process: it multiplied
+display-encoded values, which is not an exposure.
 
 ## Status
 

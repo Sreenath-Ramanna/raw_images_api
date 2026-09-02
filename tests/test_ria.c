@@ -296,13 +296,27 @@ static void test_adjustments(void) {
     CHECK(memcmp(img->data, before->data, img->data_size) == 0,
           "identity adjustment changes nothing");
 
-    /* +1 EV doubles the linear signal, up to clipping. */
+    /*
+     * There used to be an exposure test here asserting that +1 EV on an
+     * encoded 64 gives 128. That is the encoded-domain doubling, and it is
+     * wrong: 64/255 encoded through a 2.222 gamma is 0.0498 linear, and one
+     * stop up is 0.0996, which re-encodes to 90 — not 128. The assertion was
+     * pinning the defect in place, so both it and the field it tested are
+     * gone. Exposure now lives in the scene-referred domain; the round trip
+     * through the transfer functions is checked in test_transfer(), and the
+     * linear-light behaviour in test_display_transform().
+     */
+
+    /* Gamma is the display-domain midtone control, and it must fix both
+     * endpoints while moving what lies between them. */
     ria_adjustments_defaults(&adj);
-    adj.exposure_ev = 1.0f;
+    adj.gamma = 2.0f;
     CHECK_OK(ria_apply_adjustments(img, &adj));
-    CHECK(abs(px8(img, 64, 0, 0) - 128) <= 2, "+1 EV on 64 gives %d",
-          px8(img, 64, 0, 0));
-    CHECK(px8(img, 200, 0, 0) == 255, "bright values clip rather than wrap");
+    CHECK(px8(img, 0, 0, 0) == 0, "gamma fixes black: %d", px8(img, 0, 0, 0));
+    CHECK(px8(img, 255, 0, 0) == 255, "gamma fixes white: %d",
+          px8(img, 255, 0, 0));
+    CHECK(px8(img, 128, 0, 0) > 150, "gamma 2.0 lifts the midtones: %d",
+          px8(img, 128, 0, 0));
     ria_image_free(img);
 
     /* Any curve built from these controls must stay non-decreasing: an
@@ -359,6 +373,194 @@ static void test_adjustments(void) {
     ria_image_free(before);
 }
 
+static void test_transfer(void) {
+    section("transfer functions");
+
+    const ria_transfer kinds[] = {RIA_TRANSFER_SRGB, RIA_TRANSFER_GAMMA};
+    for (unsigned k = 0; k < 2; k++) {
+        for (int i = 0; i <= 20; i++) {
+            const float v = (float)i / 20.0f;
+            const float enc = ria_transfer_encode(v, kinds[k], 2.222f, 4.5f);
+            const float back = ria_transfer_decode(enc, kinds[k], 2.222f, 4.5f);
+            CHECK(fabsf(back - v) < 1e-4f,
+                  "transfer %u round trip at %.2f gave %.5f", k, (double)v,
+                  (double)back);
+        }
+        /* Endpoints must be exact, or black and white drift on every pass. */
+        CHECK(ria_transfer_encode(0.0f, kinds[k], 2.222f, 4.5f) == 0.0f,
+              "transfer %u encodes 0 to 0", k);
+        CHECK(ria_transfer_encode(1.0f, kinds[k], 2.222f, 4.5f) == 1.0f,
+              "transfer %u encodes 1 to 1", k);
+        /* Encoding must brighten: it exists to spend code values on shadows. */
+        CHECK(ria_transfer_encode(0.18f, kinds[k], 2.222f, 4.5f) > 0.35f,
+              "transfer %u lifts middle grey above 0.35", k);
+    }
+
+    CHECK(ria_transfer_encode(0.5f, RIA_TRANSFER_LINEAR, 0, 0) == 0.5f,
+          "linear transfer is the identity");
+
+    /*
+     * The concrete statement of why exposure_ev was removed.
+     *
+     * An encoded 64 is 0.0787 in linear light; one stop up is 0.1575, which
+     * re-encodes to 97. The old display-domain implementation doubled the
+     * encoded value and returned 128. At mid-grey the same error takes 128 to
+     * 255 where the correct answer is 184 — the naive result is 0.93 EV too
+     * bright, and above encoded 192 it is pinned at white with no headroom
+     * left at all.
+     *
+     * Note these are *not* the values a pure 2.222 power function gives.
+     * LibRaw's curve has a linear toe of slope 4.5, which lifts the shadows
+     * considerably; ignoring it puts the mid-grey figure at 174 rather than
+     * 184. The expected values here come from the real curve.
+     */
+    const struct { int in, expect; } ev_cases[] = {
+        {32, 53}, {64, 97}, {96, 140}, {128, 184}, {160, 228},
+    };
+    for (unsigned i = 0; i < sizeof(ev_cases) / sizeof(ev_cases[0]); i++) {
+        const float e = (float)ev_cases[i].in / 255.0f;
+        const float lin = ria_transfer_decode(e, RIA_TRANSFER_GAMMA, 2.222f,
+                                              4.5f);
+        const float up = ria_transfer_encode(lin * 2.0f, RIA_TRANSFER_GAMMA,
+                                             2.222f, 4.5f);
+        const int code = (int)(up * 255.0f + 0.5f);
+        CHECK(abs(code - ev_cases[i].expect) <= 1,
+              "+1 EV on encoded %d gives %d, expected %d", ev_cases[i].in, code,
+              ev_cases[i].expect);
+        /* The whole point: linear-correct is always darker than doubling. */
+        const int naive = ev_cases[i].in * 2 > 255 ? 255 : ev_cases[i].in * 2;
+        CHECK(code < naive, "and stays below the encoded doubling of %d", naive);
+    }
+}
+
+static void test_display_transform(void) {
+    section("display transform");
+
+    ria_display_transform dt;
+    ria_display_transform_defaults(&dt);
+    CHECK(dt.mode == RIA_DISPLAY_CLIP, "defaults to clipping");
+    CHECK(fabsf(dt.grey_point - 0.18f) < 1e-6f, "grey point is 0.18");
+    CHECK(fabsf(dt.white_point - 1.0f) < 1e-6f, "white point is 1.0");
+
+    /* A linear ramp through the default transform must equal encoding it. */
+    ria_image* scene = make_gradient(256, 1, RIA_FMT_RGB8);
+    ria_image_set_encoding(scene, RIA_TRANSFER_LINEAR, 1.0f, 1.0f,
+                           RIA_COLORSPACE_SRGB);
+    ria_image* shown = NULL;
+    CHECK_OK(ria_apply_display_transform(scene, &dt, RIA_FMT_RGB8, &shown));
+    CHECK(shown->transfer == RIA_TRANSFER_GAMMA, "output is labelled encoded");
+
+    int worst = 0;
+    for (int x = 0; x < 256; x++) {
+        const float expect = ria_transfer_encode((float)x / 255.0f,
+                                                 RIA_TRANSFER_GAMMA, 2.222f,
+                                                 4.5f);
+        const int d = abs(px8(shown, x, 0, 0) - (int)(expect * 255.0f + 0.5f));
+        if (d > worst) worst = d;
+    }
+    CHECK(worst <= 1, "default transform is the encode curve (worst diff %d)",
+          worst);
+    ria_image_free(shown);
+
+    /* Halving the grey point is exactly one stop of brightening. */
+    ria_display_transform bright = dt;
+    bright.grey_point = 0.09f;
+    ria_image* lifted = NULL;
+    CHECK_OK(ria_apply_display_transform(scene, &bright, RIA_FMT_RGB8, &lifted));
+    const float lin_in = 64.0f / 255.0f;
+    const float expect = ria_transfer_encode(lin_in * 2.0f, RIA_TRANSFER_GAMMA,
+                                             2.222f, 4.5f);
+    CHECK(abs(px8(lifted, 64, 0, 0) - (int)(expect * 255.0f + 0.5f)) <= 1,
+          "half grey point doubles the linear value: %d", px8(lifted, 64, 0, 0));
+    ria_image_free(lifted);
+
+    /* At white_point 1.0 the shoulder is mathematically the identity, so it
+     * must agree with clipping exactly — this pins the W=1 reduction. */
+    ria_display_transform shoulder = dt;
+    shoulder.mode = RIA_DISPLAY_SHOULDER;
+    ria_image* a = NULL;
+    ria_image* b = NULL;
+    CHECK_OK(ria_apply_display_transform(scene, &dt, RIA_FMT_RGB8, &a));
+    CHECK_OK(ria_apply_display_transform(scene, &shoulder, RIA_FMT_RGB8, &b));
+    CHECK(memcmp(a->data, b->data, a->data_size) == 0,
+          "shoulder at white 1.0 is identical to clipping");
+    ria_image_free(a);
+    ria_image_free(b);
+
+    /*
+     * Given something above display white to work with, the shoulder must
+     * differ from clipping and must preserve distinctions in the highlights
+     * rather than flattening them. This is the check that catches a
+     * materialised intermediate clamping the input.
+     */
+    shoulder.white_point = 4.0f;
+    ria_display_transform clip4 = dt;
+    ria_image* rolled = NULL;
+    ria_image* clipped = NULL;
+    /* Brighten by 2 stops so the top of the ramp lands above white. */
+    shoulder.grey_point = clip4.grey_point = 0.18f / 4.0f;
+    CHECK_OK(ria_apply_display_transform(scene, &shoulder, RIA_FMT_RGB8, &rolled));
+    CHECK_OK(ria_apply_display_transform(scene, &clip4, RIA_FMT_RGB8, &clipped));
+
+    int clip_flat = 0, roll_flat = 0;
+    for (int x = 192; x < 256; x++) {
+        if (px8(clipped, x, 0, 0) == 255) clip_flat++;
+        if (px8(rolled, x, 0, 0) == 255) roll_flat++;
+    }
+    CHECK(clip_flat > roll_flat,
+          "the shoulder keeps highlight detail clipping loses: %d vs %d flat",
+          roll_flat, clip_flat);
+    CHECK(memcmp(rolled->data, clipped->data, rolled->data_size) != 0,
+          "shoulder and clip differ once there is something to roll off");
+    ria_image_free(rolled);
+    ria_image_free(clipped);
+
+    /* Display-referred input must be refused, not transformed twice. */
+    ria_image* encoded = make_gradient(16, 1, RIA_FMT_RGB8);
+    ria_image* nope = NULL;
+    CHECK(ria_apply_display_transform(encoded, &dt, RIA_FMT_RGB8, &nope) ==
+              RIA_ERR_INVALID,
+          "a display-referred image is rejected");
+    ria_image_free(encoded);
+
+    ria_image_free(scene);
+}
+
+static void test_encoding_propagation(void) {
+    section("encoding metadata");
+
+    ria_image* img = make_gradient(32, 16, RIA_FMT_RGB8);
+    CHECK(img->transfer == RIA_TRANSFER_SRGB,
+          "a fresh image defaults to display-referred sRGB");
+
+    CHECK_OK(ria_image_set_encoding(img, RIA_TRANSFER_LINEAR, 1.0f, 1.0f,
+                                    RIA_COLORSPACE_ADOBE));
+
+    /* Every operation producing a new image must carry the label across, or
+     * a resized scene-referred buffer comes back claiming to be encoded and
+     * the next EV operation refuses it for the wrong reason. */
+    struct { const char* name; ria_image* out; } cases[8];
+    int n = 0;
+
+    ria_image* t = NULL;
+    CHECK_OK(ria_image_clone(img, &t));            cases[n].name = "clone";      cases[n++].out = t;
+    CHECK_OK(ria_image_convert(img, RIA_FMT_RGBA8, &t)); cases[n].name = "convert"; cases[n++].out = t;
+    CHECK_OK(ria_crop(img, 1, 1, 8, 8, &t));       cases[n].name = "crop";       cases[n++].out = t;
+    CHECK_OK(ria_resize(img, 8, 4, RIA_RESIZE_TRIANGLE, &t)); cases[n].name = "resize"; cases[n++].out = t;
+    CHECK_OK(ria_apply_orientation(img, RIA_FLIP_90_CW, &t)); cases[n].name = "orientation"; cases[n++].out = t;
+    CHECK_OK(ria_fit_within(img, 8, 8, RIA_RESIZE_TRIANGLE, &t)); cases[n].name = "fit"; cases[n++].out = t;
+
+    for (int i = 0; i < n; i++) {
+        CHECK(cases[i].out->transfer == RIA_TRANSFER_LINEAR,
+              "%s preserves the transfer function", cases[i].name);
+        CHECK(cases[i].out->colorspace == RIA_COLORSPACE_ADOBE,
+              "%s preserves the colourspace", cases[i].name);
+        ria_image_free(cases[i].out);
+    }
+
+    ria_image_free(img);
+}
+
 static void test_statistics(void) {
     section("histogram and auto levels");
 
@@ -403,8 +605,11 @@ static void test_statistics(void) {
     memset(dark->data, 30, dark->data_size);
     ria_adjustments adj;
     CHECK_OK(ria_suggest_adjustments(dark, &adj));
-    CHECK(adj.exposure_ev > 0.0f, "a dark frame suggests more exposure: %.2f",
-          (double)adj.exposure_ev);
+    /* A dark frame should suggest a midtone lift. In the display domain that
+     * is a gamma above 1, not an exposure in stops — the value is a code
+     * value, not scene light. */
+    CHECK(adj.gamma > 1.0f, "a dark frame suggests a midtone lift: %.2f",
+          (double)adj.gamma);
     ria_image_free(dark);
 }
 
@@ -673,6 +878,96 @@ static void test_raw_file(const char* path) {
         ria_image_free(img);
     }
 
+    /* ── Phase A: the scene-referred path ───────────────────────────────── */
+
+    ria_decode_options lin;
+    ria_decode_options_scene_linear(&lin);
+    lin.half_size = 1;
+    ria_image* scene = NULL;
+    rc = ria_raw_decode(raw, &lin, &scene);
+    CHECK(rc == RIA_OK, "linear decode: %s", ria_status_string(rc));
+    if (rc == RIA_OK) {
+        CHECK(scene->transfer == RIA_TRANSFER_LINEAR,
+              "the linear preset labels its output scene-referred");
+        CHECK(scene->bits == 16, "and decodes at 16 bits");
+
+        /*
+         * The decode must leave headroom to work in. A linear,
+         * un-auto-brightened decode should sit well below saturation — if
+         * this starts failing, either the preset regressed or LibRaw changed
+         * its normalisation, and every EV operation downstream is affected.
+         */
+        size_t clipped = 0;
+        const size_t n = (size_t)scene->width * scene->height;
+        const uint16_t* p = (const uint16_t*)scene->data;
+        for (size_t i = 0; i < n; i++) {
+            const uint16_t* q = p + i * scene->channels;
+            if (q[0] == 65535 || q[1] == 65535 || q[2] == 65535) clipped++;
+        }
+        const double clip_pct = 100.0 * (double)clipped / (double)n;
+        CHECK(clip_pct < 0.5, "linear decode clips %.3f%%, expected under 0.5%%",
+              clip_pct);
+        printf("  linear decode clips %.3f%%\n", clip_pct);
+
+        /*
+         * The load-bearing test for RIA_DISPLAY_CLIP: rendering the linear
+         * decode through the default display transform must reproduce what
+         * LibRaw produces when it applies the same curve itself. If these
+         * diverge, the reimplementation of dcraw's gamma_curve is wrong and
+         * every scene-referred render is subtly off.
+         */
+        ria_decode_options direct = lin;
+        direct.gamma_power = 2.222f;
+        direct.gamma_slope = 4.5f;
+        direct.output_bits = 8;
+        ria_image* reference = NULL;
+        if (ria_raw_decode(raw, &direct, &reference) == RIA_OK) {
+            ria_image* rendered = NULL;
+            CHECK_OK(ria_apply_display_transform(scene, NULL, RIA_FMT_RGB8,
+                                                 &rendered));
+            if (rendered && rendered->data_size == reference->data_size) {
+                double sum = 0.0;
+                int worst = 0;
+                for (size_t i = 0; i < reference->data_size; i++) {
+                    const int d = abs((int)rendered->data[i] -
+                                      (int)reference->data[i]);
+                    sum += d;
+                    if (d > worst) worst = d;
+                }
+                const double mean = sum / (double)reference->data_size;
+                CHECK(mean < 1.0,
+                      "linear + display transform matches a gamma decode "
+                      "(mean diff %.3f, worst %d)", mean, worst);
+                printf("  display transform vs LibRaw gamma: mean %.3f, "
+                       "worst %d\n", mean, worst);
+            }
+            ria_image_free(rendered);
+            ria_image_free(reference);
+        }
+
+        /* Exposure, done correctly, must brighten without the encoded-domain
+         * blowout: half the grey point is one stop. */
+        ria_display_transform dt;
+        ria_display_transform_defaults(&dt);
+        dt.grey_point = 0.09f;
+        dt.mode = RIA_DISPLAY_SHOULDER;
+        dt.white_point = 2.0f;
+        ria_image* lifted = NULL;
+        CHECK_OK(ria_apply_display_transform(scene, &dt, RIA_FMT_RGB8, &lifted));
+        if (lifted) {
+            size_t white = 0;
+            for (size_t i = 0; i < lifted->data_size; i++) {
+                if (lifted->data[i] == 255) white++;
+            }
+            CHECK(100.0 * white / lifted->data_size < 5.0,
+                  "+1 EV with a shoulder does not blow out: %.2f%% at white",
+                  100.0 * white / lifted->data_size);
+            ria_image_free(lifted);
+        }
+
+        ria_image_free(scene);
+    }
+
     ria_image* sensor = NULL;
     uint32_t filters = 0;
     int black = 0, white = 0;
@@ -722,6 +1017,9 @@ int main(int argc, char** argv) {
     test_convert();
     test_geometry();
     test_adjustments();
+    test_transfer();
+    test_display_transform();
+    test_encoding_propagation();
     test_statistics();
     test_filters();
     test_focus_math();

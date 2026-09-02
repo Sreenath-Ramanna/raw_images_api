@@ -70,6 +70,57 @@ typedef enum {
 /** Human-readable, static storage, never NULL. */
 RIA_API const char* ria_status_string(ria_status status);
 
+/* ── Colour encoding ─────────────────────────────────────────────────────── */
+
+/**
+ * Which primaries `ria_image.data` is expressed in. Declared here rather than
+ * beside the decode options because an image carries it.
+ */
+typedef enum {
+    RIA_COLORSPACE_RAW      = 0,
+    RIA_COLORSPACE_SRGB     = 1,
+    RIA_COLORSPACE_ADOBE    = 2,
+    RIA_COLORSPACE_WIDE     = 3,
+    RIA_COLORSPACE_PROPHOTO = 4,
+    RIA_COLORSPACE_XYZ      = 5,
+    RIA_COLORSPACE_ACES     = 6
+} ria_colorspace;
+
+/**
+ * The transfer function encoding an image's sample values.
+ *
+ * This is the single most consequential field on an image, because it says
+ * which of two domains the pixels are in:
+ *
+ *   - RIA_TRANSFER_LINEAR is **scene-referred**: samples are proportional to
+ *     light, so ratios are photometric and an exposure value means something.
+ *     Doubling a sample is one stop, exactly.
+ *   - Anything else is **display-referred**: samples are code values for a
+ *     display. Doubling one is a brightness change of no fixed size, and
+ *     arithmetic in stops is meaningless.
+ *
+ * Operations specified in EV require linear input and say so by returning
+ * RIA_ERR_INVALID otherwise, rather than producing a plausible wrong answer.
+ */
+typedef enum {
+    RIA_TRANSFER_LINEAR = 0,  /* scene-referred                              */
+    RIA_TRANSFER_SRGB   = 1,  /* the IEC 61966-2-1 piecewise curve           */
+    RIA_TRANSFER_GAMMA  = 2   /* power + linear toe; LibRaw's gamm[0], gamm[1] */
+} ria_transfer;
+
+/**
+ * Encode a linear value, or decode back to linear. `gamma` and `slope` are
+ * used only for RIA_TRANSFER_GAMMA — 2.222 and 4.5 reproduce LibRaw's
+ * default output curve, which is Rec.709-shaped rather than sRGB-shaped.
+ *
+ * These are scalar helpers for callers and tests. Bulk conversion goes
+ * through a table; see ria_apply_display_transform.
+ */
+RIA_API float ria_transfer_encode(float linear, ria_transfer, float gamma,
+                                  float slope);
+RIA_API float ria_transfer_decode(float encoded, ria_transfer, float gamma,
+                                  float slope);
+
 /* ── Pixel buffers ───────────────────────────────────────────────────────── */
 
 typedef enum {
@@ -112,7 +163,25 @@ typedef struct {
      * consumer still has to apply, which is how embedded previews arrive.
      */
     int              pending_flip;
+
+    /**
+     * How to read `data`. See ria_transfer — RIA_TRANSFER_LINEAR marks
+     * scene-referred pixels, anything else display-referred.
+     *
+     * `ria_raw_decode` sets this from the options it was given, so a decoded
+     * image knows its own domain. Freshly allocated and wrapped images
+     * default to sRGB, which is what a caller supplying pixels from a
+     * screenshot or an image file almost always has.
+     */
+    ria_transfer     transfer;
+    float            transfer_gamma;   /* RIA_TRANSFER_GAMMA only */
+    float            transfer_slope;
+    ria_colorspace   colorspace;
 } ria_image;
+
+/** Set the encoding fields. Does not touch pixels — it corrects a label. */
+RIA_API ria_status ria_image_set_encoding(ria_image*, ria_transfer, float gamma,
+                                          float slope, ria_colorspace);
 
 #define RIA_FLIP_NONE   0
 #define RIA_FLIP_180    3
@@ -173,20 +242,11 @@ typedef enum {
     RIA_DEMOSAIC_AAHD   = 12
 } ria_demosaic;
 
-typedef enum {
-    RIA_COLORSPACE_RAW      = 0,
-    RIA_COLORSPACE_SRGB     = 1,
-    RIA_COLORSPACE_ADOBE    = 2,
-    RIA_COLORSPACE_WIDE     = 3,
-    RIA_COLORSPACE_PROPHOTO = 4,
-    RIA_COLORSPACE_XYZ      = 5,
-    RIA_COLORSPACE_ACES     = 6
-} ria_colorspace;
-
 /**
  * How a full decode should be performed. Fill with ria_decode_options_defaults
- * and then override; do not zero it yourself, since 0 is a meaningful value
- * for several fields and the defaults are not all zero.
+ * or ria_decode_options_scene_linear and then override; do not zero it
+ * yourself, since 0 is a meaningful value for several fields and the defaults
+ * are not all zero.
  */
 typedef struct {
     ria_demosaic   demosaic;      /* PPG                                     */
@@ -205,7 +265,24 @@ typedef struct {
     int            alpha;         /* 1 = return RGBA rather than RGB         */
 } ria_decode_options;
 
+/** Display-referred defaults: 8-bit, sRGB-ish gamma, ready to show. */
 RIA_API void ria_decode_options_defaults(ria_decode_options* opt);
+
+/**
+ * Scene-referred defaults: linear gamma, 16-bit, no auto-brightness,
+ * highlight blending. Use this for anything specified in EV.
+ *
+ * The display-referred defaults are the wrong input for exposure work, and
+ * measurably so. On the test frames they clip 1.4–2.3% of the image before
+ * any adjustment is applied, and `no_auto_bright = 0` contributes a
+ * scene-dependent +1.7 EV — so "+1 EV" would not mean the same thing on two
+ * different files. This preset clips 0.00–0.13% and leaves the median around
+ * -3.1 EV, with two to three stops of headroom above the 95th percentile.
+ *
+ * The output needs a display transform before it can be shown; a linear image
+ * looks far too dark on a display that expects an encoded one.
+ */
+RIA_API void ria_decode_options_scene_linear(ria_decode_options* opt);
 
 /** Camera and exposure data. Strings are NUL-terminated, "" when unknown. */
 typedef struct {
@@ -406,11 +483,105 @@ RIA_API int ria_is_raw_extension(const char* path);
 /** NULL-terminated list of the extensions ria_is_raw_extension accepts. */
 RIA_API const char* const* ria_supported_extensions(void);
 
+/* ── The display transform ───────────────────────────────────────────────── */
+
+/**
+ * Scene-referred linear in, display-referred encoded out. This is the stage
+ * LibRaw normally performs invisibly at the end of a decode; doing it
+ * separately is what allows everything in between to work in stops.
+ */
+
+typedef enum {
+    /**
+     * Scale, then hard-clip at white. Reproduces LibRaw's own behaviour, and
+     * with the default parameters reproduces it exactly.
+     */
+    RIA_DISPLAY_CLIP = 0,
+    /**
+     * Extended Reinhard: `y(1 + y/W²)/(1 + y)`, where W is `white_point`
+     * after scaling. Monotonic, leaves the shadows alone, and rolls the
+     * highlights off smoothly instead of flattening them to white.
+     *
+     * Note that with the default white_point of 1.0 this is *identical* to
+     * clipping — the curve is the identity when W = 1. The shoulder does work
+     * only when there is something above display white to compress, which
+     * means either raising white_point or brightening via grey_point.
+     */
+    RIA_DISPLAY_SHOULDER = 1
+} ria_display_mode;
+
+typedef struct {
+    ria_display_mode mode;
+
+    /**
+     * The scene-linear value placed at display middle grey. Default 0.18,
+     * the photographic grey card, which makes the mapping the identity.
+     *
+     * **This is the brightness control.** Halving it brightens by one stop.
+     * It is not called exposure because it is not one: exposure is a scale on
+     * scene light, and this is a choice about where to anchor the display.
+     * They coincide numerically, and differ in which domain owns them.
+     */
+    float grey_point;
+
+    /**
+     * The scene-linear value placed at display white. Default 1.0 (sensor
+     * saturation). Raise it to fit more highlight range into the display —
+     * 4.0 compresses two extra stops — which only does anything in
+     * RIA_DISPLAY_SHOULDER mode.
+     */
+    float white_point;
+
+    /** Output encoding. Defaults reproduce LibRaw: gamma 2.222, slope 4.5. */
+    ria_transfer transfer;
+    float        gamma;
+    float        slope;
+} ria_display_transform;
+
+RIA_API void ria_display_transform_defaults(ria_display_transform*);
+
+/**
+ * Apply the transform, producing a new image in `out_fmt`.
+ *
+ * The source must be RIA_TRANSFER_LINEAR; anything else returns
+ * RIA_ERR_INVALID rather than silently producing a wrong result — a display
+ * transform applied twice looks washed out in a way that is easy to mistake
+ * for a bad photograph.
+ *
+ * The whole transform is a one-dimensional function of sample value, so it
+ * runs from a table: one lookup per sample, no `powf` in the loop.
+ *
+ * The shoulder is applied per channel rather than to luminance. That
+ * desaturates bright highlights toward white, which is what film does and
+ * what viewers expect; the alternative preserves saturation and pushes
+ * channels out of gamut. This is the opposite of the choice made for
+ * creative tonal controls, where an unrequested hue shift is a defect — the
+ * difference is that this stage's job is to fit the scene into the display.
+ */
+RIA_API ria_status ria_apply_display_transform(const ria_image* scene,
+                                               const ria_display_transform*,
+                                               ria_pixel_format out_fmt,
+                                               ria_image** out);
+
 /* ── Tonal and colour adjustment ─────────────────────────────────────────── */
 
 /**
- * A complete tonal edit. Every field is neutral at 0 except the multipliers
- * and gamma, which are neutral at 1 — ria_adjustments_defaults sets that up.
+ * A complete tonal edit, in the **display-referred** domain. Every field is
+ * neutral at 0 except the multipliers and gamma, which are neutral at 1 —
+ * ria_adjustments_defaults sets that up.
+ *
+ * These controls are deliberately not specified in stops. They act on encoded
+ * code values, where a stop has no fixed size, and they are anchored to the
+ * perceptual midpoint of the display range rather than to scene luminance.
+ * That makes them the right tool for finishing an image and the wrong tool
+ * for exposure. For anything in EV, decode with
+ * ria_decode_options_scene_linear and work before the display transform.
+ *
+ * (There was an `exposure_ev` field here. It multiplied encoded values, so
+ * +1 EV on mid-grey clipped to white where the correct answer is 184/255. It
+ * was removed rather than repaired: the operation cannot be made correct in
+ * this domain, because the data it needs has already been through a tone
+ * curve.)
  *
  * The whole struct is applied in a single pass over the pixels. The
  * per-channel parts collapse into one lookup table per channel, built once
@@ -419,12 +590,11 @@ RIA_API const char* const* ria_supported_extensions(void);
  * all three channels at once.
  *
  * Order of operations, on values normalised to [0,1]:
- *   white balance -> exposure -> black/white point -> shadows/highlights
+ *   white balance -> black/white point -> shadows/highlights
  *   -> contrast -> gamma -> [saturation, vibrance]
  */
 typedef struct {
     float wb_r, wb_g, wb_b;   /* channel multipliers, 1 = neutral            */
-    float exposure_ev;        /* stops; +1 doubles the linear signal         */
     float black_point;        /* [0,1) mapped to black                       */
     float white_point;        /* (0,1] mapped to white                       */
     float shadows;            /* [-1,1] lift or crush the lower midtones     */

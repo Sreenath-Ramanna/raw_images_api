@@ -21,8 +21,8 @@ ria_raw_close(raw);
 
 ria_adjustments adj;
 ria_adjustments_defaults(&adj);
-adj.exposure_ev = 0.3f;
-adj.vibrance    = 0.25f;
+adj.contrast = 0.15f;
+adj.vibrance = 0.25f;
 ria_apply_adjustments(img, &adj);
 
 ria_unsharp_mask(img, 1.0f, 0.6f, 0.01f);
@@ -41,15 +41,16 @@ ria_image_free(img);
 5. [Images](#5-images) — `ria_image`, formats, conversion
 6. [Reading RAW files](#6-reading-raw-files) — `ria_raw`, metadata, previews, decoding
 7. [Autofocus](#7-autofocus)
-8. [Adjustment and colour](#8-adjustment-and-colour)
-9. [Statistics](#9-statistics)
-10. [Geometry](#10-geometry)
-11. [Spatial filters](#11-spatial-filters)
-12. [Output](#12-output)
-13. [The legacy ABI](#13-the-legacy-abi)
-14. [Performance](#14-performance)
-15. [Binding from another language](#15-binding-from-another-language)
-16. [Extending the library](#16-extending-the-library)
+8. [Scene-referred work](#8-scene-referred-work) — linear decoding, the display transform
+9. [Adjustment and colour](#9-adjustment-and-colour)
+10. [Statistics](#10-statistics)
+11. [Geometry](#11-geometry)
+12. [Spatial filters](#12-spatial-filters)
+13. [Output](#13-output)
+14. [The legacy ABI](#14-the-legacy-abi)
+15. [Performance](#15-performance)
+16. [Binding from another language](#16-binding-from-another-language)
+17. [Extending the library](#17-extending-the-library)
 
 ---
 
@@ -130,7 +131,7 @@ sudo apt-get install libraw-dev cmake ninja-build        # Debian / Ubuntu
 
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
-./build/ria_tests                    # 208 checks, no camera files needed
+./build/ria_tests                    # 304 checks, no camera files needed
 sudo cmake --install build
 ```
 
@@ -153,7 +154,7 @@ add_subdirectory(path/to/raw_images_api ${CMAKE_BINARY_DIR}/raw_images_api)
 | CMake option | Default | Effect |
 |---|---|---|
 | `RIA_BUILD_SHARED` | ON | shared library; OFF builds a static one |
-| `RIA_BUILD_LEGACY_ABI` | ON | also export the `raw_*` symbols of [§13](#13-the-legacy-abi) |
+| `RIA_BUILD_LEGACY_ABI` | ON | also export the `raw_*` symbols of [§14](#14-the-legacy-abi) |
 | `RIA_BUILD_EXAMPLES` | ON | build `ria_tool` |
 | `RIA_BUILD_TESTS` | ON | build `ria_tests` |
 | `RIA_USE_OPENMP` | ON | parallelise the pixel loops if OpenMP is present |
@@ -197,6 +198,9 @@ typedef struct {
     size_t           data_size;    /* stride * height                      */
     ria_pixel_format format;
     int              pending_flip; /* rotation NOT yet applied             */
+    ria_transfer     transfer;     /* which domain the samples are in      */
+    float            transfer_gamma, transfer_slope;
+    ria_colorspace   colorspace;
 } ria_image;
 ```
 
@@ -204,6 +208,11 @@ The fields are public so that `data` can go straight to a texture upload or
 another library without a copy. Rows are contiguous and `stride` is currently
 always `width * channels * bits/8` — read the field rather than recomputing
 it, so that padded buffers remain possible later.
+
+`transfer` says whether the samples are scene-referred (`RIA_TRANSFER_LINEAR`,
+proportional to light, where a stop is a stop) or display-referred (anything
+else). It is the field the EV-based operations check before agreeing to run.
+See [§8](#8-scene-referred-work).
 
 `pending_flip` is a LibRaw orientation code (`RIA_FLIP_NONE`, `RIA_FLIP_180`,
 `RIA_FLIP_90_CCW` = 5, `RIA_FLIP_90_CW` = 6). Non-zero means *the consumer
@@ -462,7 +471,114 @@ plausible rather than broken — change it only on visual evidence.
 `ria_focus_area` is a centre, a width and a height, in pixels of the decoded
 image.
 
-## 8. Adjustment and colour
+## 8. Scene-referred work
+
+An exposure value is a ratio of *linear* light. `ria_raw_decode`'s default
+output is display-referred — LibRaw has applied a tone curve and clipped the
+highlights — so arithmetic in stops on that output is meaningless. Measured on
+the test frames, the default decode clips **1.4–2.3 %** of the image before any
+adjustment, and `no_auto_bright = 0` contributes a scene-dependent **+1.7 EV**,
+so "+1 EV" would not even mean the same thing on two different files.
+
+Every image therefore carries its own domain:
+
+```c
+typedef enum {
+    RIA_TRANSFER_LINEAR = 0,   /* scene-referred: a stop is a stop */
+    RIA_TRANSFER_SRGB   = 1,
+    RIA_TRANSFER_GAMMA  = 2,   /* LibRaw's power-plus-toe curve    */
+} ria_transfer;
+```
+
+`ria_image.transfer` is set by the decode from the options it was given.
+Operations specified in EV require `RIA_TRANSFER_LINEAR` and return
+`RIA_ERR_INVALID` otherwise, rather than producing a plausible wrong answer.
+
+### The pipeline
+
+```c
+ria_decode_options opt;
+ria_decode_options_scene_linear(&opt);   /* linear, 16-bit, no auto-bright */
+
+ria_image* scene;
+ria_decode_file("photo.CR3", &opt, &scene);
+/* ... scene-referred work happens here ... */
+
+ria_display_transform dt;
+ria_display_transform_defaults(&dt);
+dt.grey_point = 0.18f / 2.0f;            /* +1 EV */
+
+ria_image* shown;
+ria_apply_display_transform(scene, &dt, RIA_FMT_RGB8, &shown);
+```
+
+`ria_decode_options_scene_linear` sets `gamma 1.0`, `output_bits 16`,
+`no_auto_bright 1` and `highlight_mode 0`. The last is deliberate: modes above
+0 renormalise to fit reconstructed highlights, which moves the median by about
+a stop and by a *file-dependent* amount, so 1.0 would no longer mean sensor
+saturation. Measured with mode 0, the median lands at −3.11 EV and −3.09 EV on
+two different cameras and the anchor holds. The cost is 0.126 % clipping on one
+test frame.
+
+16-bit is not optional here. Linear encoding spends its code values unevenly —
+32768 in the top stop, 128 in the −8…−7 EV stop — and 8-bit linear leaves the
+shadows with a handful of levels, so any lift posterises. 16-bit linear still
+beats 8-bit gamma at every point down to about −10 EV.
+
+### The display transform
+
+```c
+ria_status ria_apply_display_transform(const ria_image* scene,
+                                       const ria_display_transform*,
+                                       ria_pixel_format out_fmt,
+                                       ria_image** out);
+```
+
+| field | default | meaning |
+|---|---|---|
+| `mode` | `RIA_DISPLAY_CLIP` | or `RIA_DISPLAY_SHOULDER` for a highlight rolloff |
+| `grey_point` | 0.18 | the scene-linear value placed at display middle grey |
+| `white_point` | 1.0 | the scene-linear value placed at display white |
+| `transfer`, `gamma`, `slope` | gamma 2.222 / 4.5 | the output curve |
+
+With the defaults the tonal mapping is the identity and the stage is just the
+output curve, which **reproduces a LibRaw decode**: verified against a direct
+gamma decode of the same file at a mean difference of 0.19 code values, worst
+case 1.
+
+**`grey_point` is the brightness control.** Halving it brightens by exactly one
+stop, because the data is linear. It is not called exposure because it is not
+one — exposure is a scale on scene light and this is a choice about where to
+anchor the display — but on linear input the two coincide numerically.
+
+`RIA_DISPLAY_SHOULDER` applies extended Reinhard, `y(1 + y/W²)/(1 + y)`, where
+W is `white_point` after scaling. Note that **at `white_point = 1.0` this is
+exactly the identity**, so the shoulder does nothing until there is something
+above display white to compress — raise `white_point`, or brighten via
+`grey_point`. Demonstrated end to end: on a test frame, `+1.7 EV` clipped
+0.15 % of pixels while `+2.5 EV` with `white_point = 3.0` reached the same mean
+brightness and clipped **0.00 %**.
+
+The shoulder is applied per channel, which desaturates bright highlights toward
+white — what film does and what viewers expect. That is the opposite of the
+choice made for creative tonal controls, where an unrequested hue shift is a
+defect; the difference is that this stage's job is to fit the scene into the
+display.
+
+### Scalar helpers
+
+```c
+float ria_transfer_encode(float linear, ria_transfer, float gamma, float slope);
+float ria_transfer_decode(float encoded, ria_transfer, float gamma, float slope);
+ria_status ria_image_set_encoding(ria_image*, ria_transfer, float gamma,
+                                  float slope, ria_colorspace);
+```
+
+`RIA_TRANSFER_GAMMA` is LibRaw's curve, a power function with a **linear toe**
+— not a pure power. The toe matters: ignoring it puts `+1 EV` on encoded 128 at
+174 rather than the correct 184.
+
+## 9. Adjustment and colour
 
 ```c
 void       ria_adjustments_defaults(ria_adjustments*);
@@ -477,7 +593,6 @@ One struct describes a complete tonal edit, applied in a single pass:
 | field | neutral | range | effect |
 |---|---|---|---|
 | `wb_r`, `wb_g`, `wb_b` | 1.0 | > 0 | per-channel multipliers |
-| `exposure_ev` | 0 | -5..5 | stops; +1 doubles the linear signal |
 | `black_point` | 0 | [0,1) | input level mapped to black |
 | `white_point` | 1 | (0,1] | input level mapped to white |
 | `shadows` | 0 | -1..1 | positive lifts the lower midtones |
@@ -488,6 +603,14 @@ One struct describes a complete tonal edit, applied in a single pass:
 | `vibrance` | 0 | -1.. | saturation weighted toward flat colour |
 
 Applied in that order, on values normalised to [0,1].
+
+**These controls are display-referred, and none of them is in stops.** They
+act on encoded code values, where a stop has no fixed size. There was an
+`exposure_ev` field here; it multiplied encoded values, so `+1 EV` on mid-grey
+gave 255 where the correct answer is 184 — 0.93 EV too bright. It was removed
+rather than repaired, because the operation cannot be made correct in this
+domain. For anything in stops, see [§8](#8-scene-referred-work) — decode
+linear and work before the display transform.
 
 **Why one struct rather than ten functions.** Every control above except
 saturation and vibrance acts on one channel at a time, independently of the
@@ -515,7 +638,7 @@ already-vivid sky alone. That is the whole difference between the two.
 for a curve the parametric controls cannot express, such as one drawn by a
 user or read from a profile. Alpha is never mapped.
 
-## 9. Statistics
+## 10. Statistics
 
 ```c
 ria_status ria_compute_histogram(const ria_image*, ria_histogram* out);
@@ -543,7 +666,7 @@ the numbers before committing to them. The exposure correction is capped at
 one stop either way, because beyond that the frame is deliberately high or low
 key and "fixing" it is worse than leaving it alone.
 
-## 10. Geometry
+## 11. Geometry
 
 ```c
 ria_status ria_apply_orientation(const ria_image*, int flip, ria_image**);
@@ -574,7 +697,7 @@ resize does not round twice.
 `ria_fit_within` scales to fit a box while preserving aspect ratio, and never
 enlarges — thumbnail generation, in one call.
 
-## 11. Spatial filters
+## 12. Spatial filters
 
 ```c
 ria_status ria_gaussian_blur(ria_image*, float sigma);
@@ -594,7 +717,7 @@ frame is sigma 1.0, amount 0.6, threshold 0.01. Alpha is not sharpened.
 Edges clamp to the last real pixel in both filters, so a blurred border does
 not darken.
 
-## 12. Output
+## 13. Output
 
 ```c
 ria_status ria_write_pnm(const ria_image*, const char* path);
@@ -606,7 +729,7 @@ the only writer: it is dependency-free and exists so that tests and CLI tools
 can dump a result. Real output formats — JPEG, TIFF, PNG — belong to the
 caller, who almost always has an encoder already.
 
-## 13. The legacy ABI
+## 14. The legacy ABI
 
 `raw_images_api_legacy.h` declares the flat ABI that `raw_viewer`'s
 `libraw_wrapper.so` exported before this library existed:
@@ -629,7 +752,7 @@ Struct sizes are 32, 32, 156 and 40 bytes, unchanged.
 no processing, and its structs cannot change without breaking the callers it
 exists to serve. Turn it off with `-DRIA_BUILD_LEGACY_ABI=OFF`.
 
-## 14. Performance
+## 15. Performance
 
 Measured with `ria_tool bench` on an 8-core x86-64 desktop, LibRaw 0.22.2,
 release build with OpenMP. Full-resolution 8-bit RGB output.
@@ -666,7 +789,7 @@ What the numbers say:
   the image. Sharpen after resizing, not before, whenever the output is
   smaller than the frame.
 
-## 15. Binding from another language
+## 16. Binding from another language
 
 The ABI was shaped for this. Everything crosses as a pointer or an `int`; no
 struct is passed or returned by value; no callbacks, no varargs, no bitfields;
@@ -688,7 +811,7 @@ Watch for:
 - **Free with the matching function**, not your language's allocator. The
   pixel buffer inside an `ria_image` is not separately owned.
 
-## 16. Extending the library
+## 17. Extending the library
 
 The seams that new work is expected to arrive on:
 

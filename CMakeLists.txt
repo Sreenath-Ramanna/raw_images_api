@@ -34,6 +34,7 @@ set(RIA_SOURCES
   src/ria_focus.c
   src/ria_adjust.c
   src/ria_filter.c
+  src/ria_display.c
 )
 
 if(RIA_BUILD_LEGACY_ABI)

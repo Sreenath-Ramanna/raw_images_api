@@ -91,15 +91,27 @@ Modes above 0 **rescale the whole image**, not only the highlights:
 | 2 blend | 0.7789 | 0.000 % |
 | 3 rebuild | 0.9997 | 0.001 % |
 
-Changing the mode therefore changes the brightness of the result, by up to
-two thirds of a stop. It cannot be switched without renormalising, and a UI
-that exposes it as a "highlight recovery" toggle will look like it also has an
-exposure slider attached. Either normalise against a reference decode, or
-document the coupling loudly.
+Changing the mode therefore changes the brightness of the result. Measured on
+the linear preset, mode 2 moves the **median** by −0.88 EV on the Nikon frame
+and −0.94 EV on the Canon, and leaves the maximum at 0.154 on one and 0.779 on
+the other.
 
-`highlight_mode 2` (blend) is the recommended default for the linear preset:
-it removes the clipping entirely on the test files, and its rescaling is the
-mildest of the three non-clipping modes.
+That second number is the problem. The scene-referred domain is only useful if
+1.0 means something fixed, and under `highlight_mode 0` it does — sensor
+saturation, on every file, with the median landing at −3.11 EV and −3.09 EV on
+two different cameras. Under mode 2 the anchor moves by a file-dependent
+amount, and since the zone system (§6) measures EV relative to white, a white
+that moves per file makes "shadows" mean something different in every image.
+
+**So the linear preset uses `highlight_mode 0`**, accepting 0.126 % clipping on
+the Canon frame (none on the Nikon) in exchange for a stable EV scale. A caller
+who would rather have that highlight detail can set the mode themselves, and
+must then expect a brightness shift of up to a stop and an EV scale that is no
+longer comparable across files.
+
+A UI exposing this as a "highlight recovery" toggle will appear to have a
+hidden exposure slider attached. Normalise against a reference decode, or
+document the coupling loudly.
 
 ---
 
@@ -130,7 +142,7 @@ one spans both (histograms — see §6).
      │
      │  ria_raw_decode, linear preset:
      │    gamma 1.0, output_bits 16, no_auto_bright 1,
-     │    highlight_mode 2, WB as shot or as requested
+     │    highlight_mode 0, WB as shot or as requested
      ▼
   ┌──────────────────────────────────────────────┐
   │  SCENE-REFERRED  (linear, 1.0 = saturation)  │
@@ -206,16 +218,14 @@ rounding effect, not headroom.)*
 
 ### How much headroom does the linear decode actually leave?
 
-Measured, after `gamma 1.0` + `no_auto_bright` + `highlight_mode 2`:
+Measured, after `gamma 1.0` + `no_auto_bright` + `highlight_mode 0`:
 
 | | Nikon | Canon |
 |---|---|---|
 | median | −3.11 EV | −3.09 EV |
 | p95 | −2.00 EV | −1.60 EV |
-| p99.9 | −2.77 EV¹ | −2.31 EV |
-| brightest pixel | 0.154 (−2.70 EV) | 0.779 (−0.36 EV) |
-
-¹ *lower than p95 because `highlight_mode 2` rescales — see §0.*
+| p99.9 | −1.88 EV | −1.37 EV |
+| brightest pixel | 0.284 (−1.81 EV) | 1.000 (0.00 EV) |
 
 So the linear decode leaves **2–3 stops of unused range above the 95th
 percentile**. Within that, `+2 EV` globally is essentially free, and the
@@ -797,7 +807,7 @@ as the tone engine, so it is free in the fused path (§3).
 
 | existing | fate |
 |---|---|
-| `ria_adjustments.exposure_ev` | **Remove.** It multiplies display-encoded values, so `+1 EV` on mid-grey clips to 255 where the correct answer is 174. It cannot be fixed in place — the correct operation needs scene-referred data. Replaced by `ria_tone_ev.exposure_ev`. |
+| `ria_adjustments.exposure_ev` | **Removed in Phase A.** It multiplied display-encoded values, so `+1 EV` on mid-grey clipped to 255 where the correct answer is 184 — 0.93 EV too bright. It cannot be fixed in place; the correct operation needs scene-referred data. Replaced by `ria_tone_ev.exposure_ev` in Phase E, with `ria_display_transform.grey_point` covering it in the meantime. |
 | `ria_adjustments.shadows`, `.highlights` | **Supersede** with the zone system, which is strictly more capable. Keep for one release with a doc note; remove at 0.3. |
 | `ria_adjustments.contrast` | **Keep.** Display-space, 0.5 pivot, perceptually anchored — a different and legitimate control. Document the difference from `contrast_ev` explicitly. |
 | `ria_adjustments.black_point`, `.white_point` | Keep. Display space, unrelated. |
