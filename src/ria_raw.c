@@ -218,6 +218,38 @@ ria_status ria_raw_metadata(ria_raw* raw, ria_metadata* out) {
     return RIA_OK;
 }
 
+ria_status ria_raw_color_data(ria_raw* raw, ria_color_data* out) {
+    if (!raw || !out) return RIA_ERR_INVALID;
+    ria_status rc = rewind_if_needed(raw);
+    if (rc != RIA_OK) return rc;
+
+    memset(out, 0, sizeof(*out));
+    libraw_data_t* lr = raw->lr;
+
+    for (int i = 0; i < 4; i++) {
+        out->cam_mul[i] = lr->color.cam_mul[i];
+        out->pre_mul[i] = lr->color.pre_mul[i];
+        for (int j = 0; j < 3; j++) out->cam_xyz[i][j] = lr->color.cam_xyz[i][j];
+    }
+    out->colors = lr->idata.colors;
+
+    /*
+     * WBCT_Coeffs is a fixed 64-row array with no count beside it; LibRaw
+     * leaves the unused tail zeroed, so a zero Kelvin entry is the terminator.
+     * Stopping at the first one rather than trusting the whole array is what
+     * keeps a caller from interpolating through rows of zeroes.
+     */
+    for (int i = 0; i < 64; i++) {
+        if (lr->color.WBCT_Coeffs[i][0] <= 0.0f) break;
+        for (int j = 0; j < 5; j++) {
+            out->wbct[i][j] = lr->color.WBCT_Coeffs[i][j];
+        }
+        out->wbct_rows = i + 1;
+    }
+
+    return RIA_OK;
+}
+
 /* ── Embedded preview ────────────────────────────────────────────────────── */
 
 ria_status ria_raw_preview(ria_raw* raw, ria_preview** out) {

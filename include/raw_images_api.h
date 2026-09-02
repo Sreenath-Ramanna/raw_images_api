@@ -463,6 +463,39 @@ RIA_API ria_status ria_raw_sensor_image(ria_raw* raw, ria_image** out,
                                         int* out_black, int* out_white);
 
 /**
+ * The raw materials for a colour temperature calculation.
+ *
+ * LibRaw will not give you a Kelvin value, and neither does this call: it
+ * hands back the four inputs from which one is derived, because the derivation
+ * is a matter of judgement — which locus, which method, and whether the result
+ * is meaningful at all for the illuminant in question.
+ *
+ * `cam_xyz` is the camera's own characterisation, `cam[i] = sum_j cam_xyz[i][j]
+ * * XYZ[j]` for XYZ under D65. Inverting its 3x3 leading block takes a camera
+ * neutral to XYZ, and `(1/cam_mul[0], 1/cam_mul[1], 1/cam_mul[2])` is the
+ * camera neutral the shot was balanced to — those two together give the
+ * as-shot white point.
+ *
+ * `wbct_rows` is 0 on most bodies. When it is not, `wbct[i][0]` is a colour
+ * temperature in Kelvin and `wbct[i][1..4]` the camera's own multipliers for
+ * it — the vendor's answer, which beats any colorimetric reconstruction of
+ * it. Canon populates this (15 rows, 2400-10900 K on the EOS R7); Nikon
+ * does not.
+ *
+ * Available immediately after open; no unpack or decode is required.
+ */
+typedef struct {
+    float cam_mul[4];      /* as-shot multipliers, camera channel order      */
+    float pre_mul[4];      /* LibRaw's daylight multipliers                  */
+    float cam_xyz[4][3];   /* XYZ(D65) -> camera; row 3 used on 4-colour CFAs */
+    int   colors;          /* sensor colour channels, 3 or 4                 */
+    int   wbct_rows;       /* rows populated in `wbct`; 0 when absent        */
+    float wbct[64][5];     /* Kelvin, then four multipliers                  */
+} ria_color_data;
+
+RIA_API ria_status ria_raw_color_data(ria_raw* raw, ria_color_data* out);
+
+/**
  * The underlying `libraw_data_t*`, for callers that need a LibRaw feature
  * this API does not wrap. Unstable by definition: it exposes LibRaw's ABI,
  * and mutating it can invalidate the handle's own state.

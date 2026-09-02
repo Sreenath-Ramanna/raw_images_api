@@ -768,6 +768,15 @@ static void test_pnm(void) {
 
 /* ── Optional: real files ────────────────────────────────────────────────── */
 
+static void test_color_data_arguments(void) {
+    printf("colour data arguments\n");
+    ria_color_data cd;
+    CHECK(ria_raw_color_data(NULL, &cd) == RIA_ERR_INVALID,
+          "NULL handle is rejected");
+    CHECK(ria_raw_color_data((ria_raw*)&cd, NULL) == RIA_ERR_INVALID,
+          "NULL output is rejected");
+}
+
 static void test_raw_file(const char* path) {
     printf("raw file: %s\n", path);
 
@@ -812,6 +821,43 @@ static void test_raw_file(const char* path) {
         printf("  preview %d x %d, %zu KB\n", preview->width, preview->height,
                preview->data_size / 1024);
         ria_preview_free(preview);
+    }
+
+    ria_color_data cd;
+    CHECK_OK(ria_raw_color_data(raw, &cd));
+    CHECK(cd.colors == meta.colors, "colour data agrees with metadata");
+    CHECK(cd.cam_mul[1] > 0.0f, "as-shot green multiplier is populated");
+    /*
+     * cam_xyz is a colour matrix, so its 3x3 leading block must be invertible
+     * for the camera neutral to be taken back to XYZ at all. A zero
+     * determinant means LibRaw has no characterisation for this body, and
+     * every colorimetric route downstream is meaningless.
+     */
+    {
+        const float(*m)[3] = cd.cam_xyz;
+        const double det =
+            (double)m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) -
+            (double)m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) +
+            (double)m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+        CHECK(fabs(det) > 1e-6, "cam_xyz is invertible (det %.4f)", det);
+    }
+    CHECK(cd.wbct_rows >= 0 && cd.wbct_rows <= 64, "wbct row count in range");
+    for (int i = 0; i < cd.wbct_rows; i++) {
+        CHECK(cd.wbct[i][0] > 1000.0f && cd.wbct[i][0] < 30000.0f,
+              "wbct row %d is a plausible temperature (%.0f K)", i,
+              cd.wbct[i][0]);
+        CHECK(cd.wbct[i][2] > 0.0f, "wbct row %d has a green multiplier", i);
+    }
+    /* The terminator search must not leave a populated row past the count. */
+    if (cd.wbct_rows < 64) {
+        CHECK(cd.wbct[cd.wbct_rows][0] == 0.0f,
+              "the row after the last is empty");
+    }
+    if (cd.wbct_rows > 0) {
+        printf("  wb table: %d rows, %.0f-%.0f K\n", cd.wbct_rows,
+               cd.wbct[cd.wbct_rows - 1][0], cd.wbct[0][0]);
+    } else {
+        printf("  wb table: none; colorimetric route only\n");
     }
 
     /* Metadata after a preview read must still work: the handle rewinds. */
@@ -1025,6 +1071,8 @@ int main(int argc, char** argv) {
     test_focus_math();
     test_pnm();
     test_missing_file();
+
+    test_color_data_arguments();
 
     for (int i = 1; i < argc; i++) test_raw_file(argv[i]);
 
