@@ -139,3 +139,24 @@ display-encoded values, which is not an exposure.
 Version 0.1.0. The API is young and the struct layouts are append-only from
 here, but function signatures may still change before 1.0. The legacy `raw_*`
 ABI is frozen by definition.
+
+## Licence
+
+MIT — see [LICENSE](LICENSE).
+
+### Third-party
+
+The MIT licence covers this repository's own source. The library links
+[LibRaw](https://www.libraw.org/), which is **LGPL-2.1-only or CDDL-1.0**,
+with parts under BSD-3-Clause, and is not covered by the above.
+
+The linkage is dynamic — `libraw_images_api.so` resolves `libraw_r.so` from
+the system — so a recipient of a binary can substitute their own build of
+LibRaw, which is what LGPL-2.1 §6 asks of anyone distributing one. Publishing
+source carries no such obligation.
+
+Everything implemented here is written from published descriptions rather than
+adapted from an existing implementation. That is a deliberate constraint: the
+two mature open-source RAW processors, darktable and RawTherapee, are GPL
+*applications*, so lifting from either would relicense this library. See
+[PLAN.md](PLAN.md) §1.
