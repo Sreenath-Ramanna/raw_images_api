@@ -79,27 +79,25 @@ static ria_status rewind_if_needed(ria_raw* raw) {
     return open_source(raw);
 }
 
-static ria_status raw_create(ria_raw** out, ria_raw** self) {
+/* An empty handle with a live LibRaw object, before a source is attached. */
+static ria_raw* raw_create(void) {
     ria_raw* raw = (ria_raw*)calloc(1, sizeof(*raw));
-    if (!raw) return RIA_ERR_MEMORY;
+    if (!raw) return NULL;
 
     raw->lr = libraw_init(0);
     if (!raw->lr) {
         free(raw);
-        return RIA_ERR_MEMORY;
+        return NULL;
     }
-    *self = raw;
-    (void)out;
-    return RIA_OK;
+    return raw;
 }
 
 ria_status ria_raw_open(const char* path, ria_raw** out) {
     if (!path || !out) return RIA_ERR_INVALID;
     *out = NULL;
 
-    ria_raw* raw = NULL;
-    ria_status rc = raw_create(out, &raw);
-    if (rc != RIA_OK) return rc;
+    ria_raw* raw = raw_create();
+    if (!raw) return RIA_ERR_MEMORY;
 
     raw->path = strdup(path);
     if (!raw->path) {
@@ -107,7 +105,7 @@ ria_status ria_raw_open(const char* path, ria_raw** out) {
         return RIA_ERR_MEMORY;
     }
 
-    rc = open_source(raw);
+    ria_status rc = open_source(raw);
     if (rc != RIA_OK) {
         ria_raw_close(raw);
         return rc;
@@ -121,14 +119,13 @@ ria_status ria_raw_open_buffer(const void* data, size_t size, ria_raw** out) {
     if (!data || size == 0 || !out) return RIA_ERR_INVALID;
     *out = NULL;
 
-    ria_raw* raw = NULL;
-    ria_status rc = raw_create(out, &raw);
-    if (rc != RIA_OK) return rc;
+    ria_raw* raw = raw_create();
+    if (!raw) return RIA_ERR_MEMORY;
 
     raw->buffer = data;
     raw->buffer_size = size;
 
-    rc = open_source(raw);
+    ria_status rc = open_source(raw);
     if (rc != RIA_OK) {
         ria_raw_close(raw);
         return rc;
