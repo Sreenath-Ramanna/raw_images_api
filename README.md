@@ -120,10 +120,15 @@ vendor-neutral.
 
 ## Roadmap
 
-[PLAN.md](PLAN.md) plans colour temperature reading and setting, EV-binned
-zone histograms, and per-zone exposure control. It also records a correctness
-problem it uncovered in the existing `exposure_ev`, which applies its
-multiplication to display-encoded rather than linear values.
+[approach.md](approach.md) is the design for colour temperature reading and
+setting, EV-binned zone histograms, per-zone exposure control, and
+exposure/contrast in stops. [PLAN.md](PLAN.md) sequences that work.
+
+Both turn on one point: those operations are only meaningful on
+**scene-referred linear** data, and the current decode is display-referred —
+it clips 1.4–2.3 % of a frame and applies a scene-dependent +1.7 EV before any
+control is touched. `ria_adjustments.exposure_ev` is defective for that
+reason and is removed rather than patched.
 
 ## Status
 
