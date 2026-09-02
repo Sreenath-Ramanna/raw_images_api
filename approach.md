@@ -53,6 +53,54 @@ The linear decode has the median at −3.1 EV with two stops of headroom above
 the 95th percentile and essentially nothing clipped. That is the data these
 features need.
 
+### Where the clipping actually comes from
+
+A second measurement, going back to the sensor data itself and then varying
+LibRaw's highlight handling:
+
+| | Nikon Z 6_2 | Canon EOS R7 |
+|---|---|---|
+| sensor black / white level | 1008 / 16383 | 2047 / 16383 |
+| brightest photosite, vs white | **−1.55 EV** | 0.00 EV |
+| photosites at or above white | ~0 % | < 0.0005 % |
+| linear decode clipped, `highlight_mode 0` | 0.000 % | **0.126 %** |
+| linear decode clipped, `highlight_mode 2` | 0.000 % | **0.000 %** |
+
+Two things follow, and both matter more than bit depth does.
+
+**Clipping in the Canon decode is created by white balance, not inherited from
+the sensor.** Essentially no photosites are saturated, yet the decode clips
+0.126 % of pixels. The as-shot multipliers scale red by ~1.92, so a red
+photosite at 0.6 of saturation lands above 1.0 after balancing. This is the
+concrete argument for §5's Mode A: **white balance decides what clips**, so it
+has to be applied where the decision can still be made well — in camera space,
+before demosaic, where `highlight_mode` can reconstruct from the channels that
+did not clip.
+
+**The Nikon frame has 1.55 stops of entirely unused sensor range** — it is
+underexposed at capture. For that file, `+1.5 EV` is free in any format.
+
+### A trap in `highlight_mode`
+
+Modes above 0 **rescale the whole image**, not only the highlights:
+
+| mode | Canon max output | clipped |
+|---|---|---|
+| 0 clip | 1.0000 | 0.126 % |
+| 1 unclip | 0.6434 | 0.001 % |
+| 2 blend | 0.7789 | 0.000 % |
+| 3 rebuild | 0.9997 | 0.001 % |
+
+Changing the mode therefore changes the brightness of the result, by up to
+two thirds of a stop. It cannot be switched without renormalising, and a UI
+that exposes it as a "highlight recovery" toggle will look like it also has an
+exposure slider attached. Either normalise against a reference decode, or
+document the coupling loudly.
+
+`highlight_mode 2` (blend) is the recommended default for the linear preset:
+it removes the clipping entirely on the test files, and its rescaling is the
+mildest of the three non-clipping modes.
+
 ---
 
 ## 1. Two domains
@@ -82,7 +130,7 @@ one spans both (histograms — see §6).
      │
      │  ria_raw_decode, linear preset:
      │    gamma 1.0, output_bits 16, no_auto_bright 1,
-     │    highlight_mode as chosen, WB as shot or as requested
+     │    highlight_mode 2, WB as shot or as requested
      ▼
   ┌──────────────────────────────────────────────┐
   │  SCENE-REFERRED  (linear, 1.0 = saturation)  │
@@ -112,19 +160,23 @@ one spans both (histograms — see §6).
 Everything currently in `ria_adjustments` sits in the lower box and stays
 there. The upper box is new.
 
-**The stages need not be materialised separately.** For the common path —
-decode, adjust, show — the scene-referred operations and the display transform
-fuse into one pass over the pixels (§3). The boxes are a statement about
+**The stages must not be materialised separately** on the common path. Writing
+the scene-referred result to a 16-bit buffer before the display transform
+clamps anything the tone engine pushed above 1.0, which is precisely the data
+the highlight shoulder exists to roll off. Fusing the two is a correctness
+requirement, not an optimisation — see §3. The boxes are a statement about
 *order and domain*, not about buffer count.
 
 ---
 
 ## 3. Working format
 
-### Why 16-bit linear is nearly enough, and where it isn't
+### Bit depth is precision, not range
 
-Linear encoding spends code values unevenly across the tonal range. In 16-bit
-linear, the number of distinct codes available in the stop below *n* EV is
+These are separate properties and only one of them is about clipping.
+
+**Depth is precision.** Linear encoding spends code values unevenly: in 16-bit
+linear the number of distinct codes in the stop below *n* EV is
 `65535 × 2^−(n+1)`:
 
 | stop | codes available |
@@ -134,71 +186,110 @@ linear, the number of distinct codes available in the stop below *n* EV is
 | −8 … −7 EV | 128 |
 | −10 … −9 EV | 32 |
 
-For comparison, 8-bit gamma-encoded data gives roughly 20–30 codes per stop
-everywhere. So **16-bit linear beats 8-bit gamma at every point down to about
-−10 EV**, and the zone range this design cares about is −8…0 EV. Shadow
-precision is not the problem.
+8-bit gamma-encoded data gives roughly 20–30 codes per stop everywhere. So
+**16-bit linear beats 8-bit gamma at every point down to about −10 EV**, and
+the zone range this design cares about is −8…0 EV. Lifting shadows by 3 EV in
+8-bit posterises; in 16-bit linear it does not. This is the half of the
+question where more bits genuinely buy something.
 
-The problem is **headroom**. 16-bit linear has none: 1.0 is the top of the
-container as well as sensor saturation, so `+3 EV` applied to anything above
-−3 EV clips immediately, and the operation is destroyed rather than merely
-degraded.
+**Range is not affected by depth at all.** Both depths normalise to
+[0, max]; a value above white clips at 255 exactly as it clips at 65535. The
+clip *point* is identical, the ruler below it is finer. The measurement in §0
+demonstrates it directly: two **16-bit** decodes, one clipping 1.01 % and the
+other 0.00 %. Same depth, and the difference is entirely where the data sat
+relative to the ceiling.
 
-### Recommendation
+*(A minor exception, visible in §0: the 8-bit gamma decode clipped 1.41 %
+against 16-bit's 1.01 %. That 0.4 point gap is quantisation — in 8-bit more
+near-white values round up to indistinguishable-from-white. Real, but a
+rounding effect, not headroom.)*
 
-Add a float sample type, and use it for any buffer that will be held across
-multiple scene-referred operations:
+### How much headroom does the linear decode actually leave?
+
+Measured, after `gamma 1.0` + `no_auto_bright` + `highlight_mode 2`:
+
+| | Nikon | Canon |
+|---|---|---|
+| median | −3.11 EV | −3.09 EV |
+| p95 | −2.00 EV | −1.60 EV |
+| p99.9 | −2.77 EV¹ | −2.31 EV |
+| brightest pixel | 0.154 (−2.70 EV) | 0.779 (−0.36 EV) |
+
+¹ *lower than p95 because `highlight_mode 2` rescales — see §0.*
+
+So the linear decode leaves **2–3 stops of unused range above the 95th
+percentile**. Within that, `+2 EV` globally is essentially free, and the
+adjustments these features actually make are smaller than the worst case
+suggests: a `+3 EV` *shadow* lift applies near-zero gain at the top end,
+because that is exactly what the zone weights are for (§7). The case that
+genuinely exceeds the container is a large global positive exposure on an
+already bright frame — real, but not the common path.
+
+### Recommendation: 16-bit linear now, float when someone needs it
+
+**Phase A ships 16-bit linear and no float sample type.** The reasoning:
+
+1. Shadow precision — the half of the problem depth solves — is handled.
+2. The linear decode leaves 2–3 stops of headroom, so the realistic
+   adjustment envelope fits.
+3. **The intermediate values that exceed 1.0 never need to live in a buffer.**
+   See the fused path below. Headroom is needed *during the computation*, and
+   a float register costs nothing.
+
+A float sample type is still worth having eventually, for the caller who wants
+to hold a scene-referred buffer across many operations and not think about
+clamping:
 
 ```c
 RIA_FMT_RGB32F  = 6,
 RIA_FMT_RGBA32F = 7,
-```
-
-`ria_image.bits` becomes 32 for these, and a new appended field distinguishes
-float from integer:
-
-```c
 typedef enum { RIA_SAMPLE_UINT = 0, RIA_SAMPLE_FLOAT = 1 } ria_sample_type;
 /* appended to ria_image */
 ria_sample_type sample_type;
 ```
 
-Float is unbounded, so headroom is free, `−3 EV` followed by `+3 EV` is exactly
-the identity, and there is no quantisation to reason about. The cost is
-memory: **a 33 MP RGB float buffer is 400 MB** against 200 MB for 16-bit and
-100 MB for 8-bit. That is real, and it is why the next paragraph matters.
+But it costs **400 MB for a 33 MP RGB frame** against 200 MB for 16-bit, and
+adding a third sample type to every loop in `ria_image.c`, `ria_adjust.c` and
+`ria_filter.c` is a large, mechanical, bug-prone change. Defer it until a
+caller has a use for it, then add it narrowly: `ria_image_convert` in both
+directions, the scene-referred operations, and nothing else — existing
+display-domain operations return `RIA_ERR_UNSUPPORTED` for float with a
+documented reason.
 
-### Do not make every operation float-aware at once
+The one thing to get right *now* is that the appended-field plan above stays
+possible. It does: `sample_type` is appended, and every operation already
+switches on `bits`.
 
-Adding a third sample type to every loop in `ria_image.c`, `ria_adjust.c` and
-`ria_filter.c` is a large, mechanical, bug-prone change that none of these
-features need. Instead:
+### The fused path — where the headroom actually lives
 
-- `ria_image_convert` learns float, in both directions.
-- The **new** scene-referred operations (§5, §7, §8) accept float *and* 16-bit
-  linear, since they are new code written once.
-- The **existing** display-domain operations keep their 8/16-bit paths and
-  return `RIA_ERR_UNSUPPORTED` for float, with a documented reason.
+This is what makes the deferral safe rather than merely convenient.
 
-That keeps the change proportionate and lets float support spread only where
-it earns its place.
-
-### The fused path
-
-A caller who wants "decode, apply a tone edit, give me 8-bit for the screen"
-should never materialise a 400 MB buffer. The tone engine (§8) is a
-one-dimensional function of luminance, and the display transform is a
-one-dimensional function of value, so:
+The tone engine (§8) is a one-dimensional function of luminance and the
+display transform (§9) is a one-dimensional function of value, so the whole
+chain collapses into a single pass:
 
 ```
-16-bit linear in  →  [ luminance → gain LUT ]  →  [ display transform LUT ]  →  8-bit out
+16-bit linear in
+   → compute Y, look up gain            ─┐
+   → scale RGB                           │  all in float registers,
+   → display transform: shoulder + curve │  never written to memory
+   → quantise                           ─┘
+→ 8-bit display out
 ```
 
-is a single pass with two lookups and three multiplies per pixel, no
-intermediate allocation, and no float image. Offer this as
-`ria_render_scene_to_display()` and make it the documented default. The
-materialised float buffer is for the case where a caller genuinely wants to
-keep editing.
+A pixel that the tone engine pushes to 4.0 is held in a float register, rolled
+off by the shoulder, and lands inside [0,1] before anything is stored. **It is
+never clamped, because it is never written to a 16-bit buffer.** The headroom
+exists exactly where it is needed and costs one register.
+
+This is also the only way the shoulder in §9 does any work: a shoulder applied
+to data that has already clamped at 1.0 has nothing to compress. Fusing is
+therefore not an optimisation here, it is a correctness requirement — a
+materialised 16-bit scene buffer between the tone engine and the display
+transform would silently defeat the highlight rolloff.
+
+Offer it as `ria_render_scene_to_display()` and make it the documented default
+path. Two lookups and three multiplies per pixel, no intermediate allocation.
 
 ---
 
@@ -255,10 +346,19 @@ applied to **camera-space linear sensor data before demosaic**, which is the
 only place they can be applied without consequence.
 
 Why it matters that this is before demosaic and before clipping: the three
-channels saturate at different scene luminances, and white balance changes
-*which* one clips first. Doing it early means LibRaw's highlight handling
+channels saturate at different scene luminances, and **white balance decides
+which one clips first**. Doing it early means LibRaw's highlight handling
 (`highlight_mode`) sees the corrected data and can reconstruct from the
 unclipped channels. Doing it late means the clip pattern is already baked in.
+
+The measurement in §0 makes this concrete rather than theoretical. The Canon
+frame has essentially **no saturated photosites** — its brightest is exactly at
+the white level and fewer than 0.0005 % reach it — yet the decode clips
+0.126 % of output pixels at `highlight_mode 0`. That clipping is manufactured
+by the white balance: red is scaled by ~1.92, so a red photosite at 0.6 of
+saturation lands above 1.0 after balancing. Change the target temperature and
+you change which pixels clip and in which channel. That is not something a
+post-hoc adaptation can undo.
 
 Cost: a re-decode, 1.5–3 s. The handle already re-reads the file when a decode
 has consumed it, so this is one call.
@@ -266,7 +366,7 @@ has consumed it, so this is one call.
 ### Mode B — on scene-referred linear (fast, and now nearly exact)
 
 The previous revision described this as a rough approximation. On
-**display-encoded** data it is. On **scene-referred linear float** it is very
+**display-encoded** data it is. On **scene-referred linear** data it is very
 nearly exact, and this is the single biggest practical gain from the
 correction.
 
@@ -518,6 +618,12 @@ the previous revision, which proposed a Mode A / Mode B split for exposure by
 analogy with white balance. That split is unnecessary: **exposure needs no
 re-decode, provided the decode was linear and un-auto-brightened.**
 
+Two bounds on "exact", both from §3. Downward, 16-bit linear quantisation
+means `−3 EV` then `+3 EV` recovers to within a few code values rather than
+bit-identically. Upward, the result must not be written to a 16-bit buffer
+before the display transform sees it, or anything above 1.0 clamps — which is
+why the fused path is a correctness requirement and not a speed trick.
+
 The one thing a re-decode still buys is highlight *reconstruction* — LibRaw's
 `highlight_mode` 1–3 recovering detail from channels that did not clip. That is
 a decode option worth setting up front, not a reason to re-decode per
@@ -672,6 +778,14 @@ smooth, has no magic constants, and is about four lines. It is what makes
 patch. A full filmic curve with a toe and a parametrised shoulder is a
 reasonable later addition; Reinhard is the right amount of machinery for v1.
 
+**The shoulder only works on unclamped input**, so this stage has to be fused
+with the tone engine rather than reading a materialised 16-bit scene buffer
+(§3). A pixel the tone engine pushed to 4.0 must still be 4.0 when the
+shoulder sees it; if it was stored and clamped to 1.0 first, the shoulder
+compresses nothing and the highlights are flat white regardless of the mode
+setting. This is the single easiest way to implement the whole design and get
+no benefit from it.
+
 `grey_point` is where the "brightness" control from §8 lives.
 
 The whole transform is a 1-D function of luminance and folds into the same LUT
@@ -704,8 +818,10 @@ window for this is now.
 
 Properties that must hold, all cheap to assert:
 
-- **Round trips.** `−3 EV` then `+3 EV` on a float buffer is the identity.
-  `contrast_ev = c` then `−c` is the identity. `cct → mul → cct` within 1 %.
+- **Round trips.** `contrast_ev = c` then `−c` is the identity.
+  `cct → mul → cct` within 1 %. `−3 EV` then `+3 EV` is the identity *within
+  quantisation* on 16-bit linear — assert a bound (a few code values), not
+  exact equality, and tighten it to exact if a float buffer is ever added.
 - **Partition of unity.** `Σ ria_zone_weights(e) == 1` for every `e` across
   the range, to float tolerance.
 - **Monotonicity.** For a grid of zone settings across ±3 EV,
@@ -719,6 +835,18 @@ Properties that must hold, all cheap to assert:
 - **Linearity of the decode.** A synthetic check that the linear decode preset
   really is linear: decode the same file at two `bright` values and confirm the
   ratio is constant across the tonal range.
+- **The shoulder actually shoulders.** Apply `+2 EV` through the fused path
+  with `RIA_DISPLAY_SHOULDER` and confirm the highlights compress rather than
+  flatten to white — specifically, that the top percentile of the output still
+  has a spread of distinct values. This is the test that catches an
+  accidentally materialised intermediate buffer, which would clamp the input
+  to the shoulder and produce a plausible-looking but flat result. Compare
+  against `RIA_DISPLAY_CLIP` on the same input: if the two agree, the fusion
+  is broken.
+- **`highlight_mode` coupling.** Assert that modes 1–3 rescale the output
+  (measured: Canon max 1.0000 → 0.64/0.78/0.9997), so that if a LibRaw version
+  changes this behaviour the renormalisation logic is known to need revisiting
+  rather than silently shifting everyone's exposure.
 
 Two external oracles, neither currently installed, both worth adding before
 the colour temperature work is called done:

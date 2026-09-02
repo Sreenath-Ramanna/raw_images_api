@@ -21,6 +21,15 @@ effort, prior art and open decisions.
 > revised approach works on scene-referred linear data with the display
 > transform as an explicit stage. Phase A changed completely as a result;
 > §5 (feature 5) was rewritten; features 1–4 survived largely intact.
+>
+> **Revision 3.** Measuring the sensor data and LibRaw's highlight modes moved
+> the float sample type out of Phase A. Bit depth is precision, not range: a
+> linear decode already leaves 2–3 stops of headroom, and the intermediates
+> that exceed it live in float registers on the fused path rather than in a
+> buffer. Phase A drops from 2 sittings to 1.5; float becomes unscheduled
+> Phase G. Also found: the Canon's decode clipping is *manufactured by white
+> balance*, not inherited from the sensor, and `highlight_mode` > 0 rescales
+> the whole image by up to two thirds of a stop.
 
 ---
 
@@ -90,21 +99,61 @@ It is removed, not fixed — see approach.md §10.
 
 **Blocks everything. Nothing below is correct without it.**
 
-- Linear decode preset: `gamma 1.0`, `output_bits 16`, `no_auto_bright 1`.
-  Verified working — median lands at −3.1 EV with 0.00 % clipped, against
-  −0.71 EV and 1.41 % for the default.
+- Linear decode preset: `gamma 1.0`, `output_bits 16`, `no_auto_bright 1`,
+  `highlight_mode 2`. Verified — median lands at −3.1 EV with 0.00 % clipped,
+  against −0.71 EV and 1.41 % for the default.
 - `ria_image` gains `transfer`, `transfer_gamma`, `transfer_slope`,
-  `colorspace`, `sample_type` (all appended; the struct stays ABI-compatible).
-  A decoded image now knows what domain it is in.
-- Float sample type (`RIA_FMT_RGB32F`, `RIA_FMT_RGBA32F`) with
-  `ria_image_convert` support. **Not** propagated to every existing operation —
-  see approach.md §3 for why that would be disproportionate.
+  `colorspace` (all appended; the struct stays ABI-compatible). A decoded image
+  now knows what domain it is in.
 - Display transform (`ria_apply_display_transform`), with `RIA_DISPLAY_CLIP`
-  reproducing today's behaviour exactly so nothing regresses.
+  reproducing today's behaviour exactly so nothing regresses, and
+  `RIA_DISPLAY_SHOULDER` for the extended-Reinhard rolloff.
+- The fused render path (`ria_render_scene_to_display`) — 16-bit linear in,
+  8-bit display out, intermediates in float registers. This is a **correctness**
+  requirement, not an optimisation: a materialised intermediate clamps
+  everything the tone engine pushes above 1.0, which is exactly what the
+  shoulder exists to compress (approach.md §3).
 - Remove `ria_adjustments.exposure_ev`; rewrite the tests that asserted it.
 
-**Effort: 2 sittings.** The float plumbing and the display transform are each
-about a sitting; the test rework is small but must not be skipped.
+**No float sample type.** Measurement moved this out of Phase A — see the
+re-scoping note below.
+
+**Effort: 1.5 sittings**, down from 2. The display transform and fused path
+are about a sitting together; the test rework is small but must not be
+skipped.
+
+#### Why float left Phase A
+
+Bit depth is **precision, not range**, and the two halves of "adjust without
+clipping" have different answers:
+
+- *Shadows* — depth solves it. 16-bit linear gives 128 code values in the
+  −8…−7 EV stop, against 20–30 per stop anywhere in 8-bit gamma. A +3 EV
+  shadow lift posterises in 8-bit and does not in 16-bit linear.
+- *Highlights* — depth does nothing. Both depths normalise to [0, max] and
+  clip at the same *value*. Demonstrated in approach.md §0: two **16-bit**
+  decodes, one clipping 1.01 % and the other 0.00 %.
+
+What buys top-end headroom instead, all measured:
+
+| | effect |
+|---|---|
+| linear + `no_auto_bright` | clipped 1.41 % → 0.00 % (Nikon), 2.25 % → 0.13 % (Canon) |
+| `highlight_mode 2` | Canon clipped 0.126 % → 0.000 % |
+| the resulting headroom | 2–3 stops above the 95th percentile |
+| float registers in the fused path | unbounded, and free |
+
+Since the linear decode leaves 2–3 stops spare and the intermediates that
+exceed 1.0 live in registers rather than a buffer, **16-bit linear covers the
+realistic adjustment envelope**. A `+3 EV` *shadow* lift applies near-zero gain
+at the top end by construction — that is what the zone weights are for. The
+case that genuinely overflows is a large global positive exposure on an
+already-bright frame, which is real but not the common path.
+
+Float therefore becomes Phase G, wanted when a caller needs to hold a
+scene-referred buffer across many operations without thinking about clamping.
+Phase A only has to keep it *possible*, which it does: `sample_type` is an
+appended field and every operation already switches on `bits`.
 
 ### Phase B — feature 1, reading the colour temperature
 
@@ -164,18 +213,33 @@ interactive optimisation.
 
 **Effort: 1.5 sittings.**
 
+### Phase G — float sample type
+
+`RIA_FMT_RGB32F` / `RIA_FMT_RGBA32F`, `ria_sample_type` appended to
+`ria_image`, `ria_image_convert` in both directions, and float paths in the
+scene-referred operations only. Existing display-domain operations return
+`RIA_ERR_UNSUPPORTED` for float with a documented reason, rather than growing a
+third branch in every loop.
+
+**Unscheduled.** Build it when a caller wants to hold an editable
+scene-referred buffer across many operations — not before. Costs 400 MB for a
+33 MP RGB frame against 200 MB for 16-bit.
+
+**Effort: 1.5 sittings when it happens.**
+
 ---
 
 ## 3. Sequencing and releases
 
 | Phase | Depends on | Effort |
 |---|---|---|
-| **A** scene-referred foundation | — | 2 |
+| **A** scene-referred foundation | — | 1.5 |
 | **B** read colour temperature | A (not strictly, but ships together) | 2 |
 | **C** decode at a target temperature | B | 0.5 |
 | **D** zone histogram | A | 1.5 |
 | **E** EV tone engine | A, D | 2 |
 | **F** chromatic adaptation | A, B | 1.5 |
+| **G** float sample type | A | *unscheduled* |
 
 *(Sittings, not days.)*
 
@@ -188,7 +252,8 @@ convenient; it changes no API that D or E depend on.
 
 A is genuinely non-negotiable as first. B before C because C needs the
 CCT→multiplier conversion B builds. D before E because E consumes D's weight
-functions.
+functions. G is deliberately outside the sequence — see the re-scoping note
+under Phase A.
 
 ---
 
@@ -206,8 +271,10 @@ functions.
   shadows). Nearly free once the zone weights exist, but a different feature.
 - **Tint as a first-class control** in Mode A. Feature 1 reports it; setting it
   needs the same table inversion with one more degree of freedom.
-- **Float support across the existing display-domain operations.** Add it where
-  a caller actually needs it, not pre-emptively.
+- **Float support across the existing display-domain operations.** Phase G
+  adds it to the scene-referred operations only. Spreading it through
+  `ria_image.c`, `ria_adjust.c` and `ria_filter.c` is a large mechanical change
+  that should wait for a caller who needs it.
 
 ---
 
@@ -242,10 +309,21 @@ remains — `black_point`, `white_point`, `contrast`, `saturation`, `vibrance`,
 - **The linearity fix changes what the library produces.** Only `raw_viewer`
   consumes it today and it does not use adjustments at all, so the window to do
   this cleanly is now. It closes as soon as there is a second consumer.
-- **Memory.** A 33 MP RGB float buffer is 400 MB against 130 MB for today's
-  8-bit RGBA. The fused path (approach.md §3) avoids materialising it for the
-  common case, but the fused path has to actually get built, not just
-  documented.
+- **The fused path is load-bearing and easy to get wrong.** Writing the
+  scene-referred result to a 16-bit buffer before the display transform clamps
+  everything above 1.0, and the highlight shoulder then compresses nothing.
+  The result looks plausible — highlights merely flat — so it can ship
+  unnoticed. approach.md §11 specifies the test that catches it: compare
+  `RIA_DISPLAY_SHOULDER` against `RIA_DISPLAY_CLIP` on a `+2 EV` render, and
+  fail if they agree.
+- **`highlight_mode` is coupled to exposure.** Modes 1–3 rescale the whole
+  image (Canon max 1.0000 → 0.64 / 0.78 / 0.9997), so switching modes changes
+  brightness by up to two thirds of a stop. Either renormalise against a
+  reference decode or document the coupling loudly; a UI that presents it as a
+  "highlight recovery" toggle will appear to have a hidden exposure slider.
+- **Memory.** 16-bit linear is 200 MB for a 33 MP frame against 130 MB for
+  today's 8-bit RGBA — a real increase, but bounded. Phase G's float buffers
+  would be 400 MB, which is one reason they are unscheduled.
 - **CCT is not always meaningful and the API must not pretend otherwise.** See
   the open decision above.
 - **No independent validator is installed.** `exiftool` reads Canon's own
