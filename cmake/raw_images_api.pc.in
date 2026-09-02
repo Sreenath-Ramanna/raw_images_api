@@ -1,0 +1,11 @@
+prefix=@CMAKE_INSTALL_PREFIX@
+exec_prefix=${prefix}
+libdir=${prefix}/@CMAKE_INSTALL_LIBDIR@
+includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
+
+Name: raw_images_api
+Description: Camera RAW decoding and image enhancement
+Version: @PROJECT_VERSION@
+Requires.private: libraw
+Libs: -L${libdir} -lraw_images_api
+Cflags: -I${includedir}
