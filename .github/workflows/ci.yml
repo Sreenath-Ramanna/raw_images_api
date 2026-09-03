@@ -1,0 +1,172 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Ubuntu's libraw-dev ships both libraw.pc and libraw_r.pc. The build prefers
+  # the _r flavour on its own; the configure step reports which it found so a
+  # silent fall back to the non-reentrant one is visible in the log.
+  APT_PACKAGES: libraw-dev cmake ninja-build pkg-config clang libomp-dev
+
+jobs:
+  build:
+    name: ${{ matrix.cc }} ${{ matrix.build_type }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+        build_type: [Debug, Release]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends $APT_PACKAGES
+
+      - name: Which LibRaw
+        run: |
+          if pkg-config --exists libraw_r; then
+            echo "libraw_r $(pkg-config --modversion libraw_r) — thread-safe build"
+          else
+            echo "::warning::libraw_r not found; falling back to libraw"
+            pkg-config --modversion libraw
+          fi
+
+      - name: Configure
+        env:
+          CC: ${{ matrix.cc }}
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+
+      - name: Build
+        run: cmake --build build
+
+      # The synthetic tests are the ones that run here. The RAW files the test
+      # binary also accepts are hundreds of megabytes of camera output and are
+      # not in version control.
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  abi:
+    name: exported symbols
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends $APT_PACKAGES
+
+      - name: Build
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build
+
+      # Visibility is hidden project-wide, so a public function that has lost
+      # its RIA_API macro links fine and is then invisible to dlopen. The
+      # legacy raw_* ABI has the same failure mode with -fvisibility=default,
+      # and its consumer (raw-image-review) is a different repository.
+      - name: Check the declared surface against the built object
+        run: ./scripts/check-abi.sh build/libraw_images_api.so
+
+  options:
+    name: OpenMP off
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends $APT_PACKAGES
+
+      # The serial path is a documented build option, so it has to keep
+      # compiling — the pixel loops carry OpenMP pragmas that a plain build
+      # silently ignores, and an accidental omp-only construct would only
+      # surface here.
+      - name: Build and test without OpenMP
+        run: |
+          cmake -S . -B build-serial -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DRIA_USE_OPENMP=OFF
+          cmake --build build-serial
+          ctest --test-dir build-serial --output-on-failure
+
+  install:
+    name: install and consume
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends $APT_PACKAGES
+
+      - name: Install to a prefix
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$PWD/prefix"
+          cmake --build build
+          cmake --install build
+
+      # Proves the generated .pc and the installed headers are usable by
+      # someone outside this tree, which is the whole point of installing.
+      - name: Compile a consumer against the installed package
+        run: |
+          PC_DIR="$(dirname "$(find prefix -name raw_images_api.pc | head -1)")"
+          export PKG_CONFIG_PATH="$PC_DIR"
+          cat > consumer.c <<'C'
+          #include <raw_images_api.h>
+          #include <stdio.h>
+          int main(void) {
+              printf("raw_images_api %s, LibRaw %s\n",
+                     ria_version_string(), ria_libraw_version_string());
+              return 0;
+          }
+          C
+          cc consumer.c -o consumer $(pkg-config --cflags --libs raw_images_api)
+          LD_LIBRARY_PATH="$(pkg-config --variable=libdir raw_images_api)" ./consumer
+
+  downstream:
+    name: rebuild the consumers
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    needs: [build, abi]
+    runs-on: ubuntu-latest
+    steps:
+      # Both apps mirror this library's header by hand across a repository
+      # boundary — morphosis in dart:ffi bindings, raw-image-review against the
+      # legacy ABI. Neither notices a change here until something rebuilds it,
+      # so a green build on master asks them to rebuild against this exact sha.
+      #
+      # Needs a DOWNSTREAM_TOKEN secret (a fine-grained PAT with Actions: write
+      # on both consumer repos). Without one this step says so and passes:
+      # a missing convenience must not fail the library's own build.
+      - name: Ask morphosis and raw-image-review to rebuild
+        env:
+          GH_TOKEN: ${{ secrets.DOWNSTREAM_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::notice::No DOWNSTREAM_TOKEN secret — not triggering the consumers."
+            exit 0
+          fi
+          for repo in Sreenath-Ramanna/morphosis Sreenath-Ramanna/raw-image-review; do
+            if gh workflow run ci.yml --repo "$repo" --ref main \
+                 -f ria_ref="$GITHUB_SHA"; then
+              echo "Triggered $repo against raw_images_api@${GITHUB_SHA:0:8}"
+            else
+              echo "::warning::Could not trigger $repo"
+            fi
+          done
