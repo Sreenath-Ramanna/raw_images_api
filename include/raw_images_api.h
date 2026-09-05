@@ -87,6 +87,16 @@ typedef enum {
 } ria_colorspace;
 
 /**
+ * The 3x3 converting linear sRGB to `space`, row-major.
+ *
+ * This is the table the decode applied, so a caller who decoded at
+ * output_color = space can invert it and get back to sRGB exactly.
+ * RIA_COLORSPACE_RAW has no such matrix and returns RIA_ERR_INVALID.
+ */
+RIA_API ria_status ria_colorspace_from_srgb(ria_colorspace space,
+                                            float matrix[9]);
+
+/**
  * The transfer function encoding an image's sample values.
  *
  * This is the single most consequential field on an image, because it says
@@ -177,11 +187,26 @@ typedef struct {
     float            transfer_gamma;   /* RIA_TRANSFER_GAMMA only */
     float            transfer_slope;
     ria_colorspace   colorspace;
+
+    /**
+     * The sample value that is sensor saturation, in the units of `data`.
+     *
+     * 1.0 for any decode that did not renormalise. Below 1.0 when highlight
+     * reconstruction rescaled the frame to fit the recovered highlights:
+     * LibRaw normalises the white-balance multipliers by their minimum at
+     * highlight_mode 0 and by their maximum above it, and this is the ratio.
+     * Divide a sample by this before taking log2 and the EV scale is
+     * anchored to saturation whatever the highlight mode was.
+     */
+    float            saturation_level;
 } ria_image;
 
 /** Set the encoding fields. Does not touch pixels — it corrects a label. */
 RIA_API ria_status ria_image_set_encoding(ria_image*, ria_transfer, float gamma,
                                           float slope, ria_colorspace);
+
+/** Set the saturation anchor. Does not touch pixels — it corrects a label. */
+RIA_API ria_status ria_image_set_saturation_level(ria_image*, float level);
 
 #define RIA_FLIP_NONE   0
 #define RIA_FLIP_180    3

@@ -75,6 +75,64 @@ static void set8(ria_image* img, int x, int y, int r, int g, int b) {
     if (img->channels == 4) p[3] = 255;
 }
 
+/*
+ * Exact median of the green channel of a 16-bit image. A 65536-bin count is
+ * exact for uint16 and cheaper than a sort, which matters because this runs
+ * over four full decodes of a 33 MP frame.
+ */
+static int median_green16(const ria_image* img) {
+    static unsigned bins[65536];
+    memset(bins, 0, sizeof(bins));
+    size_t n = 0;
+    for (int y = 0; y < img->height; y++) {
+        const uint16_t* row = (const uint16_t*)(img->data +
+                                                (size_t)y * img->stride);
+        for (int x = 0; x < img->width; x++) {
+            bins[row[(size_t)x * img->channels + 1]]++;
+            n++;
+        }
+    }
+    size_t seen = 0;
+    for (int v = 0; v < 65536; v++) {
+        seen += bins[v];
+        if (seen * 2 >= n) return v;
+    }
+    return 65535;
+}
+
+/* 3x3 helpers, row-major, so the colourspace matrices can be checked as
+ * matrices rather than as nine numbers. */
+static void mat3_mul(const float a[9], const float b[9], float out[9]) {
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 3; j++) {
+            double s = 0.0;
+            for (int k = 0; k < 3; k++) s += (double)a[i * 3 + k] * b[k * 3 + j];
+            out[i * 3 + j] = (float)s;
+        }
+    }
+}
+
+static double mat3_det(const float m[9]) {
+    return (double)m[0] * ((double)m[4] * m[8] - (double)m[5] * m[7]) -
+           (double)m[1] * ((double)m[3] * m[8] - (double)m[5] * m[6]) +
+           (double)m[2] * ((double)m[3] * m[7] - (double)m[4] * m[6]);
+}
+
+static int mat3_invert(const float m[9], float out[9]) {
+    const double det = mat3_det(m);
+    if (fabs(det) < 1e-12) return 0;
+    out[0] = (float)(((double)m[4] * m[8] - (double)m[5] * m[7]) / det);
+    out[1] = (float)(((double)m[2] * m[7] - (double)m[1] * m[8]) / det);
+    out[2] = (float)(((double)m[1] * m[5] - (double)m[2] * m[4]) / det);
+    out[3] = (float)(((double)m[5] * m[6] - (double)m[3] * m[8]) / det);
+    out[4] = (float)(((double)m[0] * m[8] - (double)m[2] * m[6]) / det);
+    out[5] = (float)(((double)m[2] * m[3] - (double)m[0] * m[5]) / det);
+    out[6] = (float)(((double)m[3] * m[7] - (double)m[4] * m[6]) / det);
+    out[7] = (float)(((double)m[1] * m[6] - (double)m[0] * m[7]) / det);
+    out[8] = (float)(((double)m[0] * m[4] - (double)m[1] * m[3]) / det);
+    return 1;
+}
+
 /* ── Tests ───────────────────────────────────────────────────────────────── */
 
 static void test_basics(void) {
@@ -561,6 +619,180 @@ static void test_encoding_propagation(void) {
     ria_image_free(img);
 }
 
+static void test_colorspace_matrices(void) {
+    section("colourspace matrices");
+
+    /* sRGB is the base the table is expressed against, so it must be the
+     * identity exactly — anything else moves the existing decode path. */
+    float srgb[9];
+    CHECK_OK(ria_colorspace_from_srgb(RIA_COLORSPACE_SRGB, srgb));
+    const float identity[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
+    CHECK(memcmp(srgb, identity, sizeof(identity)) == 0,
+          "sRGB is exactly the identity");
+
+    const ria_colorspace rgb_spaces[] = { RIA_COLORSPACE_ADOBE,
+                                          RIA_COLORSPACE_WIDE,
+                                          RIA_COLORSPACE_PROPHOTO,
+                                          RIA_COLORSPACE_ACES };
+    const char* rgb_names[] = { "adobe", "wide", "prophoto", "aces" };
+
+    /*
+     * A grey in must be a grey out: an RGB output space shares sRGB's white,
+     * so each row must sum to 1. Get a row transposed or a space swapped and
+     * neutrals come out coloured.
+     */
+    for (int s = 0; s < 4; s++) {
+        float m[9];
+        CHECK_OK(ria_colorspace_from_srgb(rgb_spaces[s], m));
+        for (int i = 0; i < 3; i++) {
+            const double sum = (double)m[i * 3] + m[i * 3 + 1] + m[i * 3 + 2];
+            CHECK(fabs(sum - 1.0) < 1e-5,
+                  "%s row %d preserves neutral (sums to %.6f)", rgb_names[s], i,
+                  sum);
+        }
+    }
+
+    /*
+     * XYZ is the exception and must not be checked the same way: it is not an
+     * RGB space, so white does not map to equal components but to the D65
+     * white point. The property that holds is the normalisation — Y of white
+     * is 1 — with the chromaticity of white at CIE D65, which is an external
+     * oracle rather than a golden value taken from this table.
+     */
+    {
+        float m[9];
+        CHECK_OK(ria_colorspace_from_srgb(RIA_COLORSPACE_XYZ, m));
+        double w[3];
+        for (int i = 0; i < 3; i++)
+            w[i] = (double)m[i * 3] + m[i * 3 + 1] + m[i * 3 + 2];
+        CHECK(fabs(w[1] - 1.0) < 1e-5, "XYZ white has Y = 1 (%.6f)", w[1]);
+        const double t = w[0] + w[1] + w[2];
+        CHECK(fabs(w[0] / t - 0.3127) < 5e-4 && fabs(w[1] / t - 0.3290) < 5e-4,
+              "XYZ white sits at D65 (x %.4f, y %.4f)", w[0] / t, w[1] / t);
+    }
+
+    /* Every space must be invertible, because morphosis converts back to sRGB
+     * for the preview by inverting exactly this matrix. */
+    const ria_colorspace all[] = { RIA_COLORSPACE_SRGB,  RIA_COLORSPACE_ADOBE,
+                                   RIA_COLORSPACE_WIDE,  RIA_COLORSPACE_PROPHOTO,
+                                   RIA_COLORSPACE_XYZ,   RIA_COLORSPACE_ACES };
+    const char* all_names[] = { "srgb", "adobe", "wide", "prophoto", "xyz",
+                                "aces" };
+    for (int s = 0; s < 6; s++) {
+        float m[9], inv[9] = { 0 }, round[9];
+        CHECK_OK(ria_colorspace_from_srgb(all[s], m));
+        const double det = mat3_det(m);
+        CHECK(fabs(det) > 1e-3, "%s is invertible (det %.6f)", all_names[s],
+              det);
+        CHECK(mat3_invert(m, inv), "%s inverts", all_names[s]);
+        mat3_mul(m, inv, round);
+        float worst = 0.0f;
+        for (int i = 0; i < 9; i++) {
+            const float d = fabsf(round[i] - identity[i]);
+            if (d > worst) worst = d;
+        }
+        CHECK(worst < 1e-5f, "%s round-trips through its inverse (worst %.2e)",
+              all_names[s], worst);
+    }
+
+    /*
+     * The one place a literal belongs in this test. This matrix was fitted
+     * from paired decodes of a real frame at output_color 1 and 2, so it is an
+     * independent measurement of what LibRaw actually applied — it checks the
+     * table against LibRaw rather than against itself.
+     */
+    {
+        const float fitted[9] = { 0.715145f, 0.284857f, 0.000000f,
+                                  0.000000f, 1.000000f, 0.000000f,
+                                  0.000000f, 0.041202f, 0.958836f };
+        float m[9];
+        CHECK_OK(ria_colorspace_from_srgb(RIA_COLORSPACE_ADOBE, m));
+        float worst = 0.0f;
+        for (int i = 0; i < 9; i++) {
+            const float d = fabsf(m[i] - fitted[i]);
+            if (d > worst) worst = d;
+        }
+        CHECK(worst < 1e-4f,
+              "Adobe RGB reproduces the fit from paired decodes (worst %.2e)",
+              worst);
+    }
+
+    /*
+     * Wider is wider. sRGB's red primary is inside Adobe's gamut and further
+     * inside ProPhoto's, so its own coordinate shrinks as the space widens
+     * and it starts needing green and blue to express it at all. Catches two
+     * spaces' rows being transposed or swapped.
+     */
+    {
+        float adobe[9], prophoto[9];
+        CHECK_OK(ria_colorspace_from_srgb(RIA_COLORSPACE_ADOBE, adobe));
+        CHECK_OK(ria_colorspace_from_srgb(RIA_COLORSPACE_PROPHOTO, prophoto));
+        CHECK(1.0f > adobe[0] && adobe[0] > prophoto[0],
+              "sRGB red shrinks as the space widens: 1.0 > %.4f > %.4f",
+              adobe[0], prophoto[0]);
+        CHECK(prophoto[3] > adobe[3] && prophoto[6] > adobe[6],
+              "ProPhoto needs green and blue to express sRGB red, Adobe does "
+              "not: %.4f/%.4f vs %.4f/%.4f",
+              prophoto[3], prophoto[6], adobe[3], adobe[6]);
+    }
+
+    /* Arguments are rejected, not guessed. There is no sRGB to camera-raw
+     * matrix, and an out-of-range enum must not index the table. */
+    float sink[9];
+    CHECK(ria_colorspace_from_srgb(RIA_COLORSPACE_RAW, sink) == RIA_ERR_INVALID,
+          "camera-raw has no matrix");
+    CHECK(ria_colorspace_from_srgb((ria_colorspace)7, sink) == RIA_ERR_INVALID,
+          "an unknown space is rejected");
+    CHECK(ria_colorspace_from_srgb((ria_colorspace)-1, sink) == RIA_ERR_INVALID,
+          "a negative space is rejected");
+    CHECK(ria_colorspace_from_srgb(RIA_COLORSPACE_PROPHOTO, NULL) ==
+              RIA_ERR_INVALID,
+          "a NULL matrix is rejected");
+}
+
+static void test_saturation_level(void) {
+    section("saturation anchor");
+
+    ria_image* img = make_gradient(32, 16, RIA_FMT_RGB8);
+    CHECK(img->saturation_level == 1.0f,
+          "a fresh image reads exactly 1.0 (%.9f)", img->saturation_level);
+
+    CHECK_OK(ria_image_set_saturation_level(img, 0.5f));
+
+    /* The same propagation property the encoding fields have, and for the
+     * same reason: a resized scene buffer that forgets its anchor gives every
+     * EV computed from it a different meaning. */
+    struct { const char* name; ria_image* out; } cases[4];
+    int n = 0;
+
+    ria_image* t = NULL;
+    CHECK_OK(ria_image_clone(img, &t));            cases[n].name = "clone";  cases[n++].out = t;
+    CHECK_OK(ria_image_convert(img, RIA_FMT_RGBA8, &t)); cases[n].name = "convert"; cases[n++].out = t;
+    CHECK_OK(ria_fit_within(img, 8, 8, RIA_RESIZE_TRIANGLE, &t)); cases[n].name = "fit"; cases[n++].out = t;
+    CHECK_OK(ria_apply_orientation(img, RIA_FLIP_90_CW, &t)); cases[n].name = "orientation"; cases[n++].out = t;
+
+    for (int i = 0; i < n; i++) {
+        CHECK(cases[i].out->saturation_level == 0.5f,
+              "%s preserves the saturation anchor (%.9f)", cases[i].name,
+              cases[i].out->saturation_level);
+        ria_image_free(cases[i].out);
+    }
+
+    /* An anchor of zero or below is not a scale, it is a division by zero
+     * waiting downstream. Refuse it and leave the field alone. */
+    CHECK(ria_image_set_saturation_level(img, 0.0f) == RIA_ERR_INVALID,
+          "zero is refused");
+    CHECK(ria_image_set_saturation_level(img, -1.0f) == RIA_ERR_INVALID,
+          "a negative anchor is refused");
+    CHECK(ria_image_set_saturation_level(NULL, 0.5f) == RIA_ERR_INVALID,
+          "a NULL image is refused");
+    CHECK(img->saturation_level == 0.5f,
+          "a refused set leaves the anchor alone (%.9f)",
+          img->saturation_level);
+
+    ria_image_free(img);
+}
+
 static void test_statistics(void) {
     section("histogram and auto levels");
 
@@ -1014,6 +1246,97 @@ static void test_raw_file(const char* path) {
         ria_image_free(scene);
     }
 
+    /* ── The saturation anchor under highlight reconstruction ───────────── */
+
+    {
+        ria_decode_options hl;
+        ria_decode_options_scene_linear(&hl);
+        hl.half_size = 1;
+
+        ria_image* by_mode[4] = { NULL, NULL, NULL, NULL };
+        int decoded = 1;
+        for (int mode = 0; mode < 4; mode++) {
+            hl.highlight_mode = mode;
+            if (ria_raw_decode(raw, &hl, &by_mode[mode]) != RIA_OK) {
+                by_mode[mode] = NULL;
+                decoded = 0;
+            }
+        }
+        CHECK(decoded, "all four highlight modes decode");
+
+        if (decoded) {
+            /*
+             * The existing path provably does not move. Compared bit-exactly,
+             * not with a tolerance: mode 0 divides the multipliers by their
+             * own minimum, so the reported anchor is 1.0 or the reasoning is
+             * wrong.
+             */
+            CHECK(by_mode[0]->saturation_level == 1.0f,
+                  "highlight_mode 0 reports exactly 1.0 (%.9f)",
+                  by_mode[0]->saturation_level);
+
+            const float s = by_mode[2]->saturation_level;
+            CHECK(s > 0.2f && s < 1.0f,
+                  "highlight_mode 2 reports a real rescale (%.4f)", s);
+
+            /* The reported scale IS the ratio the pixels moved by. The 1%
+             * band is quantisation: the two decodes reconstruct different
+             * pixels above the clip point and the median is binned. */
+            const int m0 = median_green16(by_mode[0]);
+            const int m2 = median_green16(by_mode[2]);
+            const double ratio = m0 > 0 ? (double)m2 / (double)m0 : 0.0;
+            CHECK(fabs(ratio - (double)s) < 0.01,
+                  "the reported scale is the median ratio: %.5f reported, "
+                  "%.5f measured", (double)s, ratio);
+            printf("  saturation anchor %.4f, median ratio %.5f "
+                   "(%d -> %d)\n", (double)s, ratio, m0, m2);
+
+            /* Modes 1, 2 and 3 differ in what they reconstruct, not in how
+             * the frame is normalised. */
+            CHECK(fabsf(by_mode[1]->saturation_level - s) < 1e-4f &&
+                      fabsf(by_mode[3]->saturation_level - s) < 1e-4f,
+                  "modes 1, 2 and 3 carry the same scale: %.6f, %.6f, %.6f",
+                  by_mode[1]->saturation_level, s,
+                  by_mode[3]->saturation_level);
+
+            /* Reconstruction must not clip more than clipping does. Equal is
+             * allowed — the Nikon frame clips 0.000% either way. */
+            size_t clip0 = 0, clip2 = 0, top2 = 0;
+            for (int y = 0; y < by_mode[0]->height; y++) {
+                const uint16_t* a = (const uint16_t*)(by_mode[0]->data +
+                                                      (size_t)y * by_mode[0]->stride);
+                const uint16_t* b = (const uint16_t*)(by_mode[2]->data +
+                                                      (size_t)y * by_mode[2]->stride);
+                for (int x = 0; x < by_mode[0]->width; x++) {
+                    const int ch = by_mode[0]->channels;
+                    for (int c = 0; c < 3; c++) {
+                        if (a[(size_t)x * ch + c] == 65535) clip0++;
+                        const uint16_t v = b[(size_t)x * ch + c];
+                        if (v == 65535) clip2++;
+                        if (v > top2) top2 = v;
+                    }
+                }
+            }
+            CHECK(clip2 <= clip0,
+                  "recovery does not clip more: %zu samples against %zu",
+                  clip2, clip0);
+
+            /*
+             * The recovered range has to fit in the float registers the tone
+             * engine works in: Tone.gainYMax is 4.0 and DisplayLut.vMax is
+             * 8.0, so the highlights reach the shoulder unclamped.
+             */
+            const double anchored = ((double)top2 / 65535.0) / (double)s;
+            CHECK(anchored < 4.0,
+                  "the recovered range fits the tone headroom (max %.3f "
+                  "anchor units)", anchored);
+            printf("  mode 2 clips %zu vs %zu samples, max %.3f anchor "
+                   "units\n", clip2, clip0, anchored);
+        }
+
+        for (int mode = 0; mode < 4; mode++) ria_image_free(by_mode[mode]);
+    }
+
     ria_image* sensor = NULL;
     uint32_t filters = 0;
     int black = 0, white = 0;
@@ -1065,7 +1388,9 @@ int main(int argc, char** argv) {
     test_adjustments();
     test_transfer();
     test_display_transform();
+    test_colorspace_matrices();
     test_encoding_propagation();
+    test_saturation_level();
     test_statistics();
     test_filters();
     test_focus_math();

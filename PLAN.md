@@ -97,6 +97,15 @@ It is removed, not fixed — see approach.md §10.
 
 ## 2. Phases
 
+**The saturation anchor and the colourspace matrices are not a phase.** They
+add only what the C side alone can supply — the highlight rescale
+(`ria_image.saturation_level`) and LibRaw's `out_rgb[]` table
+(`ria_colorspace_from_srgb`) — and none of B–G is started by them. Phase C is
+the one that would *also* append to `ria_decode_options`, and the two must not
+be in flight at once: morphosis `calloc`s that struct at the Dart size while
+`ria_decode_options_scene_linear` `memset`s at the C size, so an unmirrored
+append is a heap overflow rather than a benign mismatch.
+
 ### Phase A — scene-referred foundation ✅ done
 
 **Blocks everything. Nothing below is correct without it.**
@@ -116,7 +125,9 @@ than 2.
 - Linear decode preset: `gamma 1.0`, `output_bits 16`, `no_auto_bright 1`,
   `highlight_mode 0`. Verified — the median lands at −3.11 EV and −3.09 EV on
   two different cameras, against −0.71 EV for the display default, and 1.0
-  means sensor saturation on both.
+  means sensor saturation on both. The preset still uses `highlight_mode 0`; a
+  caller who sets a higher mode now gets the applied scale reported on
+  `ria_image.saturation_level` rather than an unexplained brightness shift.
 - `ria_image` gains `transfer`, `transfer_gamma`, `transfer_slope`,
   `colorspace` (all appended; the struct stays ABI-compatible). A decoded image
   now knows what domain it is in.
@@ -336,11 +347,12 @@ remains — `black_point`, `white_point`, `contrast`, `saturation`, `vibrance`,
   unnoticed. approach.md §11 specifies the test that catches it: compare
   `RIA_DISPLAY_SHOULDER` against `RIA_DISPLAY_CLIP` on a `+2 EV` render, and
   fail if they agree.
-- **`highlight_mode` is coupled to exposure.** Modes 1–3 rescale the whole
-  image (Canon max 1.0000 → 0.64 / 0.78 / 0.9997), so switching modes changes
-  brightness by up to two thirds of a stop. Either renormalise against a
-  reference decode or document the coupling loudly; a UI that presents it as a
-  "highlight recovery" toggle will appear to have a hidden exposure slider.
+- ~~**`highlight_mode` is coupled to exposure.**~~ **Resolved.** The rescale is
+  `min(pre_mul[c])` after `dcraw_process` — 0.5401 on the Nikon frame and
+  0.5206 on the Canon, against paired-decode median ratios of 0.54002 and
+  0.520502. The decode reports it on `ria_image.saturation_level` and leaves
+  the pixels alone, so a UI toggle recovers highlight detail without moving the
+  EV scale.
 - **Memory.** 16-bit linear is 200 MB for a 33 MP frame against 130 MB for
   today's 8-bit RGBA — a real increase, but bounded. Phase G's float buffers
   would be 400 MB, which is one reason they are unscheduled.

@@ -80,7 +80,7 @@ did not clip.
 **The Nikon frame has 1.55 stops of entirely unused sensor range** — it is
 underexposed at capture. For that file, `+1.5 EV` is free in any format.
 
-### A trap in `highlight_mode`
+### The rescale in `highlight_mode`
 
 Modes above 0 **rescale the whole image**, not only the highlights:
 
@@ -93,25 +93,30 @@ Modes above 0 **rescale the whole image**, not only the highlights:
 
 Changing the mode therefore changes the brightness of the result. Measured on
 the linear preset, mode 2 moves the **median** by −0.88 EV on the Nikon frame
-and −0.94 EV on the Canon, and leaves the maximum at 0.154 on one and 0.779 on
-the other.
+and −0.94 EV on the Canon.
 
-That second number is the problem. The scene-referred domain is only useful if
-1.0 means something fixed, and under `highlight_mode 0` it does — sensor
-saturation, on every file, with the median landing at −3.11 EV and −3.09 EV on
-two different cameras. Under mode 2 the anchor moves by a file-dependent
-amount, and since the zone system (§6) measures EV relative to white, a white
-that moves per file makes "shadows" mean something different in every image.
+The rescale is a single global gain, and recovering it costs nothing:
+`scale_colors()` normalises the white-balance multipliers by their *minimum*
+when `highlight == 0` and by their *maximum* above it, so `min(pre_mul[c])`
+read off `libraw_data_t` after `dcraw_process` is exactly 1.0 under mode 0 and
+the applied scale under any mode above it. One expression, no branch, no
+reference decode. Measured 0.5401 on the Nikon and 0.5206 on the Canon,
+against paired-decode median ratios of 0.54002 and 0.520502.
 
-**So the linear preset uses `highlight_mode 0`**, accepting 0.126 % clipping on
-the Canon frame (none on the Nikon) in exchange for a stable EV scale. A caller
-who would rather have that highlight detail can set the mode themselves, and
-must then expect a brightness shift of up to a stop and an EV scale that is no
-longer comparable across files.
+**The library reports that scale on `ria_image.saturation_level` and leaves the
+pixels alone.** Divide a sample by it before taking `log2` and 1.0 means sensor
+saturation whatever the highlight mode was, so the zone system (§6) keeps one
+EV scale across modes and across files. The pixels are left alone because
+renormalising the buffer back to the anchor would re-clip precisely what the
+reconstruction recovered: the Canon frame's maximum under mode 3 is 1.92 anchor
+units — +0.94 EV above saturation — and a 16-bit unsigned buffer cannot hold
+it.
 
-A UI exposing this as a "highlight recovery" toggle will appear to have a
-hidden exposure slider attached. Normalise against a reference decode, or
-document the coupling loudly.
+**The linear preset still uses `highlight_mode 0`.** A preset whose output
+needs no further arithmetic to mean "1.0 is saturation" is the right default,
+and the legacy `raw_*` ABI reaches the same defaults. A caller who wants the
+recovered detail sets the mode and divides by the reported scale; the cost of
+not doing so is 0.126 % clipping on the Canon frame and none on the Nikon.
 
 ---
 
@@ -300,6 +305,29 @@ transform would silently defeat the highlight rolloff.
 
 Offer it as `ria_render_scene_to_display()` and make it the documented default
 path. Two lookups and three multiplies per pixel, no intermediate allocation.
+
+### What the scene buffer carries besides pixels
+
+The scene buffer is 16-bit linear in **ProPhoto primaries**, decoded at
+`output_color = RIA_COLORSPACE_PROPHOTO`. ProPhoto is the only entry in
+LibRaw's table that actually contains a modern camera's gamut, so it is the
+only one that stops `dcraw_process` clipping saturated colour before any
+editing happens. Its wide primaries spend precision on colours the sensor never
+records, and the headroom measurement above is what says there is room for
+that: 16-bit linear carries 128 levels in the −8..−7 EV stop where 8-bit gamma
+carries 20–30 anywhere.
+
+Two labels therefore travel with the buffer, and both are needed to read a
+sample:
+
+- `transfer` says which domain the samples are in (§1).
+- `saturation_level` says which sample value is sensor saturation. It is 1.0
+  for every decode that did not renormalise, and the applied scale for one that
+  did. **A sample means an EV only after dividing by it** — `log2(v)` on a
+  buffer whose anchor is 0.5206 is off by 0.94 EV, silently.
+
+`ria_image_copy_encoding` carries both, which is what makes a cropped or
+resized scene buffer keep the EV scale of the frame it came from.
 
 ---
 
@@ -801,6 +829,28 @@ no benefit from it.
 The whole transform is a 1-D function of luminance and folds into the same LUT
 as the tone engine, so it is free in the fused path (§3).
 
+### The gamut stage
+
+The scene buffer is in the working space (§3) and the output is in a delivery
+space, so the transform is **working-space linear → output-space linear →
+transfer curve**. The working→output 3×3 comes from
+`ria_colorspace_from_srgb`, which returns LibRaw's own `out_rgb[]` row — the
+same table the decode applied, so inverting it gets back to sRGB exactly.
+
+It costs nothing per pixel. The white-balance matrix is already a 3×3 and a
+tone gain is a scalar, so the gamut matrix composes into the same nine
+multiplies: 9 for the matrix and 3 for the luminance row, which is what the
+pipeline already spent. The luminance row is `rec709 · srgbFromWorking⁻¹` —
+the same linear functional of the source that Rec.709 is of the sRGB render, so
+a preview delivered in sRGB and a TIFF delivered in ProPhoto answer "how bright
+is this pixel" identically.
+
+**The negative clamp is now the gamut clip**, and it happens here, at the
+display boundary, rather than inside `dcraw_process` before any editing. That
+relocation is the whole point of decoding wide: a colour outside the delivery
+gamut is clipped once, at the end, after the tone engine has had a chance to
+pull it back in.
+
 ---
 
 ## 10. Consequences for the existing API
@@ -853,10 +903,20 @@ Properties that must hold, all cheap to assert:
   to the shoulder and produce a plausible-looking but flat result. Compare
   against `RIA_DISPLAY_CLIP` on the same input: if the two agree, the fusion
   is broken.
-- **`highlight_mode` coupling.** Assert that modes 1–3 rescale the output
-  (measured: Canon max 1.0000 → 0.64/0.78/0.9997), so that if a LibRaw version
-  changes this behaviour the renormalisation logic is known to need revisiting
-  rather than silently shifting everyone's exposure.
+- **The reported saturation anchor is the rescale.** `highlight_mode 0` reports
+  exactly 1.0, compared bit-exactly. Modes 1, 2 and 3 report the same value as
+  each other, and that value equals `median(mode 2) / median(mode 0)` within
+  quantisation — an equality against a reported number, not a documented
+  coupling. If a LibRaw version changes how `scale_colors` normalises, this
+  fails rather than silently shifting everyone's exposure. Local only:
+  `ria_tests` needs a camera file.
+- **The colourspace matrices are matrices.** sRGB is the identity bit-exactly;
+  every RGB space's rows sum to 1, so a grey in is a grey out; every space is
+  invertible and `M · M⁻¹` is the identity to 1e-5; `RIA_COLORSPACE_RAW` and
+  out-of-range values are refused rather than indexing the table. The Adobe RGB
+  row is additionally compared against a matrix fitted from paired real decodes
+  at `output_color` 1 and 2, which is the only assertion here that checks the
+  table against LibRaw instead of against itself.
 
 Two external oracles, neither currently installed, both worth adding before
 the colour temperature work is called done:

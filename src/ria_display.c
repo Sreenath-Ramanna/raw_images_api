@@ -136,6 +136,55 @@ ria_status ria_image_set_encoding(ria_image* img, ria_transfer transfer,
     return RIA_OK;
 }
 
+ria_status ria_image_set_saturation_level(ria_image* img, float level) {
+    if (!img || !(level > 0.0f)) return RIA_ERR_INVALID;
+    img->saturation_level = level;
+    return RIA_OK;
+}
+
+/*
+ * LibRaw's out_rgb[] table, transcribed from LibRaw_constants in 0.22.2 and
+ * indexed by ria_colorspace - 1. It is hardcoded rather than linked because
+ * LibRaw_constants is a C++ symbol whose visibility no packaged libraw
+ * guarantees. The test suite checks the Adobe RGB row against a matrix fitted
+ * from paired real decodes, so the table is checked against LibRaw's actual
+ * output rather than against itself.
+ */
+static const float out_rgb_from_srgb[6][9] = {
+    /* SRGB — the identity, because the decode's own base is sRGB. */
+    { 1.0f, 0.0f, 0.0f,
+      0.0f, 1.0f, 0.0f,
+      0.0f, 0.0f, 1.0f },
+    /* ADOBE */
+    { 0.715146f, 0.284856f, 0.000000f,
+      0.000000f, 1.000000f, 0.000000f,
+      0.000000f, 0.041166f, 0.958839f },
+    /* WIDE */
+    { 0.593087f, 0.404710f, 0.002206f,
+      0.095413f, 0.843149f, 0.061439f,
+      0.011621f, 0.069091f, 0.919288f },
+    /* PROPHOTO */
+    { 0.529317f, 0.330092f, 0.140588f,
+      0.098368f, 0.873465f, 0.028169f,
+      0.016879f, 0.117663f, 0.865457f },
+    /* XYZ */
+    { 0.412456f, 0.357576f, 0.180438f,
+      0.212673f, 0.715152f, 0.072175f,
+      0.019334f, 0.119192f, 0.950304f },
+    /* ACES */
+    { 0.439680f, 0.382953f, 0.177367f,
+      0.089790f, 0.813433f, 0.096777f,
+      0.017548f, 0.111562f, 0.870890f }
+};
+
+ria_status ria_colorspace_from_srgb(ria_colorspace space, float matrix[9]) {
+    /* RIA_COLORSPACE_RAW is camera primaries, which vary per body and are not
+     * in this table at all — refuse rather than return a plausible identity. */
+    if (!matrix || (int)space < 1 || (int)space > 6) return RIA_ERR_INVALID;
+    memcpy(matrix, out_rgb_from_srgb[(int)space - 1], 9 * sizeof(float));
+    return RIA_OK;
+}
+
 /* ── The display transform ───────────────────────────────────────────────── */
 
 void ria_display_transform_defaults(ria_display_transform* dt) {

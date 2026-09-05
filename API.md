@@ -41,7 +41,7 @@ ria_image_free(img);
 5. [Images](#5-images) — `ria_image`, formats, conversion
 6. [Reading RAW files](#6-reading-raw-files) — `ria_raw`, metadata, previews, decoding
 7. [Autofocus](#7-autofocus)
-8. [Scene-referred work](#8-scene-referred-work) — linear decoding, the display transform
+8. [Scene-referred work](#8-scene-referred-work) — linear decoding, the saturation anchor, working-space matrices, the display transform
 9. [Adjustment and colour](#9-adjustment-and-colour)
 10. [Statistics](#10-statistics)
 11. [Geometry](#11-geometry)
@@ -201,6 +201,7 @@ typedef struct {
     ria_transfer     transfer;     /* which domain the samples are in      */
     float            transfer_gamma, transfer_slope;
     ria_colorspace   colorspace;
+    float            saturation_level; /* the sample value that is saturation */
 } ria_image;
 ```
 
@@ -213,6 +214,13 @@ it, so that padded buffers remain possible later.
 proportional to light, where a stop is a stop) or display-referred (anything
 else). It is the field the EV-based operations check before agreeing to run.
 See [§8](#8-scene-referred-work).
+
+`saturation_level` says which sample value is sensor saturation. It is `1.0f`
+for every image except one a highlight-reconstructing decode rescaled, and
+**a sample means an EV only after dividing by it** — see
+[§8](#8-scene-referred-work). Like `transfer`, it travels with the buffer
+through crop, resize, rotate and format conversion, so a derived image keeps
+the EV scale of the frame it came from.
 
 `pending_flip` is a LibRaw orientation code (`RIA_FLIP_NONE`, `RIA_FLIP_180`,
 `RIA_FLIP_90_CCW` = 5, `RIA_FLIP_90_CW` = 6). Non-zero means *the consumer
@@ -381,7 +389,7 @@ produces a very different result, since 0 is meaningful for several fields.
 | `no_auto_bright` | 0 | 1 disables LibRaw's histogram stretch |
 | `bright` | 1.0 | exposure scale |
 | `gamma_power`, `gamma_slope` | 2.222, 4.5 | the sRGB-like output curve |
-| `highlight_mode` | 0 | 0 clip, 1 unclip, 2 blend, 3+ rebuild |
+| `highlight_mode` | 0 | 0 clip, 1 unclip, 2 blend, 3+ rebuild; above 0 the applied rescale comes back on `ria_image.saturation_level` |
 | `user_flip` | -1 | -1 = as the camera recorded it |
 | `apply_orientation` | 1 | 0 returns unrotated pixels with `pending_flip` set |
 | `alpha` | 0 | 1 returns RGBA instead of RGB |
@@ -514,11 +522,40 @@ ria_apply_display_transform(scene, &dt, RIA_FMT_RGB8, &shown);
 
 `ria_decode_options_scene_linear` sets `gamma 1.0`, `output_bits 16`,
 `no_auto_bright 1` and `highlight_mode 0`. The last is deliberate: modes above
-0 renormalise to fit reconstructed highlights, which moves the median by about
-a stop and by a *file-dependent* amount, so 1.0 would no longer mean sensor
-saturation. Measured with mode 0, the median lands at −3.11 EV and −3.09 EV on
-two different cameras and the anchor holds. The cost is 0.126 % clipping on one
-test frame.
+0 renormalise the whole frame to fit reconstructed highlights, so 1.0 would no
+longer mean sensor saturation without further arithmetic. Measured with mode 0,
+the median lands at −3.11 EV and −3.09 EV on two different cameras and the
+anchor holds. The cost is 0.126 % clipping on one test frame.
+
+**A decode above `highlight_mode 0` reports its rescale.** The applied scale
+comes back on `ria_image.saturation_level` — measured 0.5401 and 0.5206 on the
+two test bodies — and dividing a sample by it before taking `log2` gives an EV
+anchored to saturation whichever mode produced the pixels:
+
+```c
+opt.highlight_mode = 2;                  /* LibRaw's blend reconstruction */
+ria_decode_file("photo.CR3", &opt, &scene);
+
+const float ev = log2f(sample / scene->saturation_level);
+```
+
+The pixels are deliberately left alone. Under mode 3 the recovered highlights
+reach 1.92 anchor units on one test frame, which a 16-bit unsigned buffer
+cannot hold — rescaling the buffer back to the anchor would re-clip exactly
+what the reconstruction recovered.
+
+### Working-space matrices
+
+```c
+ria_status ria_colorspace_from_srgb(ria_colorspace space, float matrix[9]);
+```
+
+The 3×3 converting linear sRGB to `space`, row-major. This is LibRaw's own
+`out_rgb[]` table — the matrix the decode applied — so a caller who decoded at
+`output_color = space` can invert it and get back to sRGB exactly, which is
+what makes a wide-gamut decode deliverable to an sRGB display.
+`RIA_COLORSPACE_RAW` is camera primaries, which vary per body and are not in
+the table: it returns `RIA_ERR_INVALID`, as does any value outside 1…6.
 
 16-bit is not optional here. Linear encoding spends its code values unevenly —
 32768 in the top stop, 128 in the −8…−7 EV stop — and 8-bit linear leaves the
@@ -572,7 +609,11 @@ float ria_transfer_encode(float linear, ria_transfer, float gamma, float slope);
 float ria_transfer_decode(float encoded, ria_transfer, float gamma, float slope);
 ria_status ria_image_set_encoding(ria_image*, ria_transfer, float gamma,
                                   float slope, ria_colorspace);
+ria_status ria_image_set_saturation_level(ria_image*, float level);
 ```
+
+Both setters correct a *label* and touch no pixels. `level` must be greater
+than zero — it is a divisor — and anything else is refused rather than stored.
 
 `RIA_TRANSFER_GAMMA` is LibRaw's curve, a power function with a **linear toe**
 — not a pure power. The toe matters: ignoring it puts `+1 EV` on encoded 128 at

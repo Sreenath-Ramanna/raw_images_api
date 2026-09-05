@@ -400,24 +400,24 @@ void ria_decode_options_scene_linear(ria_decode_options* opt) {
     opt->no_auto_bright = 1;
 
     /*
-     * Clip, not blend — despite blending recovering more highlight detail.
+     * Clip, not blend. The preset's job is a scene-referred buffer whose 1.0
+     * is sensor saturation with no further arithmetic, and highlight_mode 0
+     * is the mode that delivers exactly that.
      *
-     * The scene-referred domain is only useful if 1.0 means something fixed,
-     * and with highlight_mode 0 it does: sensor saturation. Measured across
-     * the test files, that anchor holds — the median lands at -3.11 EV and
-     * -3.09 EV on two different cameras.
+     * Modes above 0 reconstruct the clipped highlights and rescale the whole
+     * frame to fit them — 0.5401 on the Nikon test frame and 0.5206 on the
+     * Canon, which is where the 0.88 EV and 0.94 EV median shifts recorded in
+     * approach.md come from. That rescale is no longer a trap: the decode
+     * reports it on ria_image.saturation_level, so a caller who sets
+     * highlight_mode 2 gets the recovered detail and keeps a stable EV scale
+     * by dividing samples by that value before taking log2. The pixels are
+     * left alone deliberately — the recovered highlights reach 1.92 anchor
+     * units on the Canon under mode 3, which a 16-bit unsigned buffer cannot
+     * hold, so renormalising the buffer would re-clip precisely what the
+     * reconstruction recovered.
      *
-     * Modes above 0 renormalise to fit the reconstructed highlights, which
-     * moves the anchor by a file-dependent amount: the median drops 0.88 EV
-     * on the Nikon frame and 0.94 EV on the Canon, and the maximum lands at
-     * 0.154 on one and 0.779 on the other. Since the zone system measures EV
-     * relative to white, a white that moves per file makes "shadows" mean
-     * something different in every image.
-     *
-     * The cost is real but small: 0.126% of the Canon frame clips, none of
-     * the Nikon. A caller who would rather have that detail than a comparable
-     * EV scale can set highlight_mode themselves — and must then expect a
-     * brightness shift of up to a stop.
+     * The cost of clipping is real but small: 0.126% of the Canon frame,
+     * none of the Nikon.
      */
     opt->highlight_mode = 0;
 }
@@ -526,6 +526,22 @@ ria_status ria_raw_decode(ria_raw* raw, const ria_decode_options* opt,
                            is_linear ? RIA_TRANSFER_LINEAR : RIA_TRANSFER_GAMMA,
                            opt->gamma_power, opt->gamma_slope,
                            (ria_colorspace)opt->output_color);
+
+    /*
+     * min(pre_mul) after dcraw_process IS the whole-image scale.
+     * scale_colors() normalises the multipliers by their minimum when
+     * highlight == 0 and by their maximum above it, so this is exactly 1.0
+     * under mode 0 and the applied gain under any mode above it. No branch,
+     * no reference decode. Verified against the median ratio of paired
+     * decodes on two bodies: 0.5401 / 0.5206 predicted, 0.54002 / 0.520502
+     * measured.
+     */
+    float saturation = 1.0f;
+    for (int c = 0; c < 4; c++) {
+        const float m = lr->color.pre_mul[c];
+        if (m > 0.0f && m < saturation) saturation = m;
+    }
+    ria_image_set_saturation_level(*out, saturation);
     return RIA_OK;
 }
 

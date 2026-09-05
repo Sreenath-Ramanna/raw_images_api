@@ -66,6 +66,10 @@ ria_status ria_image_alloc(int width, int height, ria_pixel_format fmt,
     priv->pub.transfer_slope = 12.92f;
     priv->pub.colorspace = RIA_COLORSPACE_SRGB;
 
+    /* 1.0 is "these samples were not renormalised", which is true of every
+     * buffer except one a highlight-reconstructing decode rescaled. */
+    priv->pub.saturation_level = 1.0f;
+
     *out = &priv->pub;
     return RIA_OK;
 }
@@ -78,6 +82,7 @@ void ria_image_copy_encoding(ria_image* dst, const ria_image* src) {
     dst->transfer_gamma = src->transfer_gamma;
     dst->transfer_slope = src->transfer_slope;
     dst->colorspace = src->colorspace;
+    dst->saturation_level = src->saturation_level;
 }
 
 ria_status ria_image_like(const ria_image* like, ria_image** out) {
