@@ -741,6 +741,37 @@ baking an unasked-for hue shift into a contrast slider. Document the flatness
 and the remedy together, so the first person to notice it finds the answer
 next to the problem.
 
+### The camera look
+
+The remedy above — luminance contrast plus saturation — is also a preset, and
+Morphosis ships it as one: an opt-in look that adds a fixed base curve to the
+gain table and a saturation lift of `+20`, with every slider still reading
+zero. It is this section's pair with the values chosen rather than dragged.
+
+The curve is `base(v) = srgb_decode(dcraw_encode(1.431 · v))` on
+display-referred luminance, where `dcraw_encode` is this library's own
+`gamma_curve(2.222, 4.5)` (`src/ria_display.c:32`) and `1.431` is the gain at
+which the result reproduces a plain LibRaw decode's percentiles. Applied
+**last** — zones, then the contrast slope, then the base curve — so the sliders
+act relative to the preset instead of being consumed by it. Expressed as a
+remap of linear light rather than as an output curve, so the sRGB encode is
+untouched and the ICC profiles still describe what the pipeline applies.
+
+**Luminance-only**, for the reason this section already gives. A per-channel
+version would supply 4.3 of the 9 saturation points for free and need only
+`+13`, and it is what the camera itself does — but it is the blue-to-purple
+twist rejected above, and the preset is not the place to make the one
+exception.
+
+It is Morphosis's, not the library's: `ria_apply_display_transform` has no
+caller, and writing the curve in both places would mean mirroring it by hand
+across a repository boundary for a code path nothing executes.
+
+One fixed look cannot serve two bodies. Three of the eight frames it was
+measured on are already contrastier than their own camera JPEG, and every curve
+that helps the other five overshoots them. That is why it is opt-in and per
+photograph.
+
 ### One engine
 
 Exposure, contrast and the four zone controls are all functions from input EV
@@ -823,6 +854,12 @@ shoulder sees it; if it was stored and clamped to 1.0 first, the shoulder
 compresses nothing and the highlights are flat white regardless of the mode
 setting. This is the single easiest way to implement the whole design and get
 no benefit from it.
+
+A base curve applied before this stage may bound its own output at display
+white — Morphosis's camera look does, above `v = 1/k` — which leaves the
+shoulder nothing to compress on a neutral highlight. That is a property of the
+look and not a defect of the mode: reproducing a clipping decode is what it is
+for.
 
 `grey_point` is where the "brightness" control from §8 lives.
 
